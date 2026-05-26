@@ -1,0 +1,15 @@
+[project]
+name = "GravityAPI"
+version = "0.1.0"
+description = "a Simple API for the GravityV2 Python library which is built by me."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.136.3",
+    "gravity",
+    "plyvel>=1.5.1",
+    "uvicorn>=0.48.0",
+]
+
+[tool.uv.sources]
+gravity = { git = "https://github.com/Darsheeegamer/GravityV2" }
