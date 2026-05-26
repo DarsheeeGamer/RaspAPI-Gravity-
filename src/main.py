@@ -31,7 +31,7 @@ app.add_middleware(
 security = HTTPBearer(auto_error=False)
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verifies the bearer API token using the SQLite store."""
+    """Verifies the bearer API token using the LevelDB store."""
     if not credentials:
         raise HTTPException(status_code=401, detail="Missing API Key. Provide it in 'Authorization: Bearer grav_...' header.")
     token = credentials.credentials
