@@ -1,4 +1,5 @@
-"""LLM routing layer — model resolution, account selection, generation."""
+"""LLM routing layer — model resolution, load-balanced account selection,
+streaming + non-streaming generation."""
 
 import asyncio
 from typing import AsyncIterator, List, Optional, Any
@@ -8,8 +9,13 @@ from gravity.io import load_accounts
 from gravity.types import Message
 from gravity.tools import Tool
 
-from account import load_accounts_for_key, get_providers_for_key
+import balancer
+from account import load_accounts_for_key, get_providers_for_key, get_db
 from providers import PROVIDERS, FREE_PROVIDERS, MODEL_TO_PROVIDER
+
+
+class NoAccountError(RuntimeError):
+    """No usable account/candidate for the requested provider."""
 
 
 # ── Model resolution ──────────────────────────────────────────────────────────
@@ -45,63 +51,51 @@ def full_model_name(provider: str, model: str) -> str:
     return f"{provider}/{model}"
 
 
-# ── Account selection ─────────────────────────────────────────────────────────
+# ── Client cache ────────────────────────────────────────────────────────────
+#
+# AsyncGravityClient holds the impersonating HTTP session pool. Rebuilding it
+# per request throws away keep-alive connections (a TLS+TCP handshake on every
+# call). Cache one client per single-account AccountsFile, keyed by the
+# balancer's account key, so connections are reused across requests.
+
+_client_cache: dict[str, AsyncGravityClient] = {}
+
+
+def _client_for(candidate) -> AsyncGravityClient:
+    cli = _client_cache.get(candidate.key)
+    if cli is None:
+        cli = AsyncGravityClient(accounts=balancer.single_account_file(candidate))
+        _client_cache[candidate.key] = cli
+    return cli
+
 
 def _build_accounts_file(api_key: str, provider: str):
-    """Build an AccountsFile prioritizing custom accounts, falling back to defaults."""
+    """Legacy helper retained for discovery paths: full multi-account file."""
     from gravity.accounts import AccountsFile, EmailBundle
-
-    user_accounts = load_accounts_for_key(api_key)
-    user_providers = get_providers_for_key(api_key)
-
-    if provider in user_providers:
-        # User has their own account — use only that
-        providers_list = [
-            acc for bundle in user_accounts.emails
-            for acc in bundle.providers
-            if acc.provider.value == provider and acc.enabled
-        ]
-        if providers_list:
-            return AccountsFile(
-                schema_version=4,
-                emails=[EmailBundle(
-                    email="user@gravity.local",
-                    enabled=True,
-                    display_name="Custom",
-                    providers=providers_list,
-                )],
-            )
-
-    # Fall back to default server accounts (from ~/.gravity/accounts.json)
-    try:
-        defaults = load_accounts()
-        default_providers = [
-            acc for bundle in defaults.emails
-            for acc in bundle.providers
-            if acc.provider.value == provider and acc.enabled
-        ]
-        if default_providers:
-            return AccountsFile(
-                schema_version=4,
-                emails=[EmailBundle(
-                    email="server@gravity.local",
-                    enabled=True,
-                    display_name="Server Default",
-                    providers=default_providers,
-                )],
-            )
-    except Exception:
-        pass
-
-    # No accounts at all — return user's full file and let Gravity error
-    return user_accounts
+    accts, _pool = balancer._accounts_for(api_key, provider)
+    return AccountsFile(
+        schema_version=4,
+        emails=[EmailBundle(email="user@gravity.local", enabled=True,
+                            display_name="all", providers=accts)],
+    )
 
 
 def _is_custom_pool(api_key: str, provider: str) -> bool:
     return provider in get_providers_for_key(api_key)
 
 
-# ── Generation ────────────────────────────────────────────────────────────────
+def _sampling_metadata(temperature, max_tokens, seed=None) -> Optional[dict]:
+    meta: dict[str, Any] = {}
+    if temperature is not None:
+        meta["temperature"] = temperature
+    if max_tokens is not None:
+        meta["max_tokens"] = max_tokens
+    if seed is not None:
+        meta["seed"] = seed
+    return meta or None
+
+
+# ── Generation (load-balanced, with failover) ──────────────────────────────────
 
 async def generate_response(
     api_key: str,
@@ -113,28 +107,35 @@ async def generate_response(
     max_tokens: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> Any:
-    """Non-streaming chat completion."""
+    """Non-streaming completion. Tries balancer candidates in order until one
+    succeeds; marks health on each attempt."""
     provider, model_name = resolve_model(model)
     full_model = full_model_name(provider, model_name)
-    accounts = _build_accounts_file(api_key, provider)
-    client = AsyncGravityClient(accounts=accounts)
+    db = get_db()
+    candidates = balancer.select_candidates(db, api_key, provider)
+    if not candidates:
+        raise NoAccountError(f"no usable account for provider '{provider}'")
 
-    metadata: dict[str, Any] = {}
-    if temperature is not None:
-        metadata["temperature"] = temperature
-    if max_tokens is not None:
-        metadata["max_tokens"] = max_tokens
-    if seed is not None:
-        metadata["seed"] = seed
-
-    return await client.chat(
-        model=full_model,
-        messages=messages,
-        system_prompt=system_prompt,
-        tools=tools or [],
-        function_calling="manual" if tools else "auto",
-        metadata=metadata or None,
-    )
+    metadata = _sampling_metadata(temperature, max_tokens, seed)
+    last_err: Optional[Exception] = None
+    for cand in candidates:
+        client = _client_for(cand)
+        with balancer.Lease(db, cand) as lease:
+            try:
+                resp = await client.chat(
+                    model=full_model,
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    tools=tools or [],
+                    function_calling="manual" if tools else "auto",
+                    metadata=metadata,
+                )
+                lease.success()
+                return resp
+            except Exception as e:  # noqa: BLE001 — failover on any provider error
+                last_err = e
+                continue
+    raise last_err or NoAccountError(f"all accounts failed for '{provider}'")
 
 
 async def generate_stream(
@@ -146,26 +147,44 @@ async def generate_stream(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
 ) -> AsyncIterator[str]:
-    """Streaming chat completion — yields text tokens."""
+    """Streaming completion. Fails over between candidates **only before** the
+    first token is emitted (once bytes are sent to the client we can't retry)."""
     provider, model_name = resolve_model(model)
     full_model = full_model_name(provider, model_name)
-    accounts = _build_accounts_file(api_key, provider)
-    client = AsyncGravityClient(accounts=accounts)
+    db = get_db()
+    candidates = balancer.select_candidates(db, api_key, provider)
+    if not candidates:
+        raise NoAccountError(f"no usable account for provider '{provider}'")
 
-    metadata: dict[str, Any] = {}
-    if temperature is not None:
-        metadata["temperature"] = temperature
-    if max_tokens is not None:
-        metadata["max_tokens"] = max_tokens
+    metadata = _sampling_metadata(temperature, max_tokens)
+    last_err: Optional[Exception] = None
 
-    async for token in client.stream_response(
-        model=full_model,
-        messages=messages,
-        system_prompt=system_prompt,
-        tools=tools or [],
-        metadata=metadata or None,
-    ):
-        yield token
+    for cand in candidates:
+        client = _client_for(cand)
+        lease = balancer.Lease(db, cand)
+        lease.__enter__()
+        started = False
+        try:
+            async for token in client.stream_response(
+                model=full_model,
+                messages=messages,
+                system_prompt=system_prompt,
+                tools=tools or [],
+                metadata=metadata,
+            ):
+                started = True
+                yield token
+            lease.success()
+            lease.__exit__(None, None, None)
+            return
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            lease.__exit__(type(e), e, e.__traceback__)
+            if started:
+                # Already streamed bytes downstream — cannot fail over silently.
+                raise
+            continue  # nothing emitted yet → try next account
+    raise last_err or NoAccountError(f"all accounts failed for '{provider}'")
 
 
 async def list_models_for_provider(api_key: str, provider: str, live: bool = False) -> List[dict]:
@@ -186,12 +205,28 @@ async def list_models_for_provider(api_key: str, provider: str, live: bool = Fal
     if not live:
         return catalog
 
-    # 1. Preferred: Rust gravity core (real reverse-engineered discovery).
     secret = _first_secret_for(api_key, provider)
+
+    # 0. Discovery-list cache (DuckDB body + RocksDB TTL pointer). Model lists
+    #    change rarely; caching them is safe (not a response cache).
+    try:
+        import cache
+        hit = cache.get_discovery(provider, secret or "")
+        if hit:
+            return hit
+    except Exception:
+        pass
+
+    # 1. Preferred: Rust gravity core (real reverse-engineered discovery).
     try:
         import gravity_rs  # PyO3 wheel from API/gravity (gravity-pyo3)
         discovered = await asyncio.to_thread(gravity_rs.discover_models, provider, secret or "")
         if discovered:
+            try:
+                import cache
+                cache.put_discovery(provider, secret or "", discovered)
+            except Exception:
+                pass
             return discovered
     except Exception:
         pass

@@ -1,13 +1,14 @@
-"""Account management — CRUD for ProviderAccounts in LevelDB.
+"""Account management — provider accounts in DuckDB, indexed by RocksDB.
 
-Handles all 40+ Gravity providers. Each API key maps to a tenant-isolated
-bag of ProviderAccount objects stored as JSON in LevelDB.
+Handles all 40+ Gravity providers. Account data (the "major data") lives in
+DuckDB cells; RocksDB holds the api_key→row pointers so reads are point lookups.
+`get_db()` returns the shared RocksDB handle (plyvel-compatible API) used across
+the codebase for the hot key-value index.
 """
 
 import os
 import json
 import time
-import plyvel
 from typing import Any, Dict, Optional
 
 from gravity.accounts import (
@@ -16,19 +17,16 @@ from gravity.accounts import (
 )
 from gravity.capabilities import ProviderName, HistoryMode, ToolSupportMode, StructuredOutputMode, RemoteSessionMode
 
+import kvstore
 from providers import PROVIDERS, FREE_PROVIDERS
 
 # ── Database ──────────────────────────────────────────────────────────────────
+#
+# Hot key-value index = RocksDB (kvstore). Bulk/account data = DuckDB (store).
 
-DB_DIR = os.path.expanduser("~/nodataishere/db")
-os.makedirs(DB_DIR, exist_ok=True)
-_db: Optional[plyvel.DB] = None
-
-def get_db() -> plyvel.DB:
-    global _db
-    if _db is None:
-        _db = plyvel.DB(DB_DIR, create_if_missing=True)
-    return _db
+def get_db():
+    """Shared RocksDB handle (plyvel-compatible: get/put/delete/iterator)."""
+    return kvstore.db()
 
 
 # ── Provider enum lookup ──────────────────────────────────────────────────────
@@ -314,17 +312,13 @@ def add_account_to_db(api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     account_model = build_provider_account(provider, account_id, payload)
-
-    db_conn = get_db()
-    user_key = f"user_accounts:{api_key}".encode()
-    existing_bytes = db_conn.get(user_key)
-    accounts_list = json.loads(existing_bytes.decode()) if existing_bytes else []
-    accounts_list = [a for a in accounts_list if not (
-        a.get("account_id") == account_id and a.get("provider") == provider
-    )]
-    accounts_list.append(account_model.model_dump(mode="json"))
-    db_conn.put(user_key, json.dumps(accounts_list).encode())
-
+    import store
+    store.upsert_account(
+        api_key, account_id, provider,
+        enabled=account_model.enabled, pool=account_model.pool,
+        priority=account_model.priority, weight=account_model.weight,
+        gravity_account=account_model.model_dump(mode="json"),
+    )
     return {
         "status": "success",
         "account_id": account_id,
@@ -335,106 +329,60 @@ def add_account_to_db(api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def remove_account_from_db(api_key: str, account_id: str, provider: str) -> Dict[str, Any]:
     """Remove a specific account."""
-    db_conn = get_db()
-    user_key = f"user_accounts:{api_key}".encode()
-    existing_bytes = db_conn.get(user_key)
-    if not existing_bytes:
-        return {"status": "not_found"}
-    accounts_list = json.loads(existing_bytes.decode())
-    before = len(accounts_list)
-    accounts_list = [a for a in accounts_list if not (
-        a.get("account_id") == account_id and a.get("provider") == provider
-    )]
-    db_conn.put(user_key, json.dumps(accounts_list).encode())
-    removed = before - len(accounts_list)
-    return {"status": "success", "removed": removed}
+    import store
+    removed = store.delete_account(api_key, account_id, provider)
+    return {"status": "success" if removed else "not_found", "removed": removed}
 
 
 def list_accounts_for_key(api_key: str) -> list[Dict[str, Any]]:
-    """Return raw account dicts (without secrets) for an API key."""
-    db_conn = get_db()
-    user_key = f"user_accounts:{api_key}".encode()
-    existing_bytes = db_conn.get(user_key)
-    if not existing_bytes:
-        return []
-    accounts = json.loads(existing_bytes.decode())
-    # Strip sensitive fields before returning
-    safe = []
-    for a in accounts:
-        entry = {k: v for k, v in a.items() if k != "auth"}
-        entry["provider"] = a.get("provider")
-        entry["account_id"] = a.get("account_id")
-        entry["pool"] = a.get("pool")
-        entry["enabled"] = a.get("enabled", True)
-        safe.append(entry)
-    return safe
+    """Account summaries (no secrets) for an API key."""
+    import store
+    return store.list_account_summaries(api_key)
 
 
 def load_accounts_for_key(api_key: str) -> AccountsFile:
     """Build an AccountsFile from all accounts linked to an API key."""
-    db_conn = get_db()
-    user_key = f"user_accounts:{api_key}".encode()
-    existing_bytes = db_conn.get(user_key)
+    import store
     providers_list: list[ProviderAccount] = []
-    if existing_bytes:
-        for acc_dict in json.loads(existing_bytes.decode()):
-            try:
-                providers_list.append(ProviderAccount.model_validate(acc_dict))
-            except Exception as e:
-                print(f"[account] skip invalid: {e}")
-
+    for acc_dict in store.get_accounts(api_key):
+        try:
+            providers_list.append(ProviderAccount.model_validate(acc_dict))
+        except Exception as e:
+            print(f"[account] skip invalid: {e}")
     return AccountsFile(
         schema_version=4,
         security={"secrets_encrypted": False},
         emails=[EmailBundle(
-            email="user@gravity.local",
-            enabled=True,
-            display_name="Gateway User",
-            providers=providers_list,
+            email="user@gravity.local", enabled=True,
+            display_name="Gateway User", providers=providers_list,
         )],
     )
 
 
 def get_providers_for_key(api_key: str) -> set[str]:
-    """Return the set of provider names the key has accounts for."""
-    db_conn = get_db()
-    user_key = f"user_accounts:{api_key}".encode()
-    existing_bytes = db_conn.get(user_key)
-    if not existing_bytes:
-        return set()
-    return {a.get("provider") for a in json.loads(existing_bytes.decode()) if a.get("enabled", True)}
+    """Provider names the key has enabled accounts for (DuckDB DISTINCT)."""
+    import store
+    return store.providers_for_key(api_key)
 
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
+# ── Metrics (DuckDB analytics via request log) ─────────────────────────────────
 
-def record_request(model: str, api_key: str = ""):
+def record_request(model: str, api_key: str = "", ip: str = "", provider: str = "",
+                   status: str = "ok", cached: bool = False, latency_ms: float = 0.0,
+                   in_tokens: int = 0, out_tokens: int = 0):
     try:
-        db = get_db()
-        for key in (b"metrics:total_requests", f"metrics:key:{api_key}:total".encode()):
-            val = db.get(key)
-            db.put(key, str(int(val.decode()) + 1 if val else 1).encode())
-        mkey = f"metrics:model:{model}".encode()
-        val = db.get(mkey)
-        db.put(mkey, str(int(val.decode()) + 1 if val else 1).encode())
+        import store
+        if not provider:
+            provider = model.split("/", 1)[0] if "/" in model else model
+        store.log_request(api_key, ip, provider, model, status, cached,
+                          latency_ms, in_tokens, out_tokens)
     except Exception as e:
         print(f"[metrics] record error: {e}")
 
 
 def get_metrics() -> Dict[str, Any]:
     try:
-        db = get_db()
-        total_b = db.get(b"metrics:total_requests")
-        total = int(total_b.decode()) if total_b else 0
-        model_counts: Dict[str, int] = {}
-        for key, val in db.iterator(prefix=b"metrics:model:"):
-            model_name = key[len(b"metrics:model:"):].decode()
-            model_counts[model_name] = int(val.decode())
-        top_model = max(model_counts, key=model_counts.get) if model_counts else "none"
-        return {
-            "total_requests": total,
-            "most_used_model": top_model,
-            "model_breakdown": model_counts,
-            "status": "healthy",
-        }
+        import store
+        return store.metrics_summary()
     except Exception as e:
         return {"total_requests": 0, "most_used_model": "none", "status": "error", "error": str(e)}

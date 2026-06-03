@@ -8,8 +8,13 @@ dependencies = [
     "fastapi>=0.136.3",
     "gravity",
     "httpx>=0.28.0",
-    "plyvel>=1.5.1",
+    "pydantic>=2.0",
+    "rocksdict>=0.3.29",
+    "duckdb>=1.5.0",
     "uvicorn>=0.48.0",
+    "hypercorn>=0.17.3",
+    "aioquic>=1.2.0",
+    "cryptography>=43.0.0",
 ]
 
 [tool.uv.sources]

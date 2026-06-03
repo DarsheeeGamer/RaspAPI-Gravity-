@@ -1,60 +1,59 @@
 """GravityAPI Gateway — OpenAI-compatible multi-provider LLM gateway.
 
-Endpoints:
-  GET  /                          service status + directory
-  GET  /v1/models                 list all available models
-  GET  /v1/models/{provider}      list models for one provider
-  POST /v1/chat/completions       OpenAI-compatible chat (streaming + tools)
-  POST /v1/embeddings             windsurf/cursor native embeddings
-  POST /api/generate-key          create a new API key
-  POST /api/add                   register a provider account
-  DELETE /api/accounts/{id}       remove an account
-  GET  /api/accounts              list your linked accounts
-  GET  /api/providers             list all supported providers + capabilities
-  GET  /api/metrics               request analytics
-  GET  /docs                      interactive documentation
-  POST /admin/generate-key        generate key with custom tier (admin only)
-  POST /admin/revoke-key          revoke a key (admin only)
+Stack:
+  - RocksDB  — hot key-value index: API keys, pointers, balancer health, abuse,
+               discovery-list cache TTLs.
+  - DuckDB   — bulk + analytical store: accounts, conversation transcripts,
+               request log (metrics), discovery-list bodies.
+  - Pydantic — validated models for all stored + wire data.
+  - Load balancer with health + failover across accounts.
+  - Abuse detection (burst / duplicate / error-storm / concurrency).
+  - Server-side conversation history (opt-in via conversation_id).
+  - HTTP/3 (QUIC) via Hypercorn — see run_http3.py.
+
+Responses are NOT cached (only model-discovery lists are).
 """
 
-import fastapi as meow
-from fastapi import HTTPException, Depends, Request, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
 import json
 import time
 import secrets
+import hashlib
+import asyncio
+from typing import Any, Dict, List, Optional
 
+import fastapi as meow
+from fastapi import HTTPException, Depends, Request, Query
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+
+import abuse
+import cache
+import history
+from models import ChatRequest as ChatReq, AddAccountRequest
 from genapi import generate_api_key, validate_api_key, is_admin, revoke_api_key
-from llm import generate_response, generate_stream, resolve_model, full_model_name
+from llm import (
+    generate_response, generate_stream, resolve_model, full_model_name,
+    list_models_for_provider, NoAccountError,
+)
 from account import (
     add_account_to_db, remove_account_from_db, list_accounts_for_key,
-    record_request, get_metrics, get_db,
-    get_providers_for_key,
+    record_request, get_metrics, get_providers_for_key,
 )
+import balancer
 from providers import PROVIDERS, FREE_PROVIDERS
-
-# ── App setup ─────────────────────────────────────────────────────────────────
 
 app = meow.FastAPI(
     title="GravityAPI Gateway",
     description="Unified multi-provider LLM gateway powered by GravityV2.",
-    version="2.0.0",
+    version="3.0.0",
     docs_url=None,
     redoc_url=None,
 )
-
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+    allow_methods=["*"], allow_headers=["*"],
 )
-
 security = HTTPBearer(auto_error=False)
 
 
@@ -78,84 +77,85 @@ async def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(secur
     return token
 
 
-# ── Rate limiting ─────────────────────────────────────────────────────────────
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "0.0.0.0"
 
-def check_rate_limit(ip: str, api_key: str, provider: str):
+
+# ── Gatekeeping: abuse + rate limit ────────────────────────────────────────────
+
+def _gate(request: Request, api_key: str, provider: str, prompt_hash: str = "") -> str:
+    """Abuse-check + per-tier rate-limit. Returns the resolved pool, or raises."""
+    ip = _client_ip(request)
+
+    decision = abuse.check(api_key, ip, prompt_hash)
+    if not decision.allowed:
+        raise HTTPException(
+            429 if decision.action != "hard_ban" else 403,
+            detail=decision.to_dict(),
+            headers={"Retry-After": str(decision.retry_after_s)} if decision.retry_after_s else None,
+        )
+
     has_custom = provider in get_providers_for_key(api_key)
-    if api_key == "grav_demoapikey":
-        limit = 5
-    elif has_custom:
-        limit = 2000
-    else:
-        limit = 20
-
-    hour = int(time.time() / 3600)
-    db = get_db()
-    rl_key = f"ratelimit:{api_key}:{ip}:{hour}".encode()
-    count_b = db.get(rl_key)
-    count = int(count_b.decode()) if count_b else 0
-    if count >= limit:
-        raise HTTPException(429, f"Hourly rate limit of {limit} req/hr exceeded.")
-    db.put(rl_key, str(count + 1).encode())
-
-    # Require custom account for non-free providers
     if not has_custom and provider not in FREE_PROVIDERS:
         raise HTTPException(
             400,
             f"Provider '{provider}' requires a registered account. "
-            "Add one via POST /api/add . See GET /api/providers for all providers.",
+            "Add one via POST /api/add . See GET /api/providers.",
         )
 
+    # Hourly rate limit (sliding hour bucket) in RocksDB.
+    limit = 2000 if has_custom else (5 if api_key == "grav_demoapikey" else 20)
+    from account import get_db
+    db = get_db()
+    hour = int(time.time() / 3600)
+    rl_key = f"ratelimit:{api_key}:{ip}:{hour}".encode()
+    raw = db.get(rl_key)
+    count = int(raw.decode()) if raw else 0
+    if count >= limit:
+        raise HTTPException(429, f"Hourly rate limit of {limit} req/hr exceeded.")
+    db.put(rl_key, str(count + 1).encode())
 
-# ── Message/tool conversion ───────────────────────────────────────────────────
+    return "custom" if has_custom else "default", decision.action  # type: ignore
+
+
+# ── Message / tool conversion ──────────────────────────────────────────────────
 
 def _parse_messages(raw: List[Dict[str, Any]]):
     from gravity.types import Message, ToolCall, ToolResult
-
-    messages = []
-    system_prompt = None
-
+    messages, system_prompt = [], None
     for m in raw:
         role = m.get("role", "user")
         content = m.get("content") or ""
-
         if role == "system":
             if not system_prompt:
                 system_prompt = content
             messages.append(Message.system(content))
-
         elif role == "user":
             if isinstance(content, list):
                 content = "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
             messages.append(Message.user(content))
-
         elif role == "assistant":
-            tcs_raw = m.get("tool_calls") or []
             tool_calls = []
-            for tc in tcs_raw:
-                func = tc.get("function", {})
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function", {})
                 try:
-                    args = json.loads(func.get("arguments", "{}"))
+                    args = json.loads(fn.get("arguments", "{}"))
                 except Exception:
                     args = {}
                 tool_calls.append(ToolCall(
                     id=tc.get("id") or f"call_{secrets.token_hex(4)}",
-                    name=func.get("name", ""),
-                    arguments=args,
-                ))
+                    name=fn.get("name", ""), arguments=args))
             messages.append(Message(role="assistant", content=content or "", tool_calls=tool_calls))
-
         elif role == "tool":
             try:
-                content_val = json.loads(content) if isinstance(content, str) else content
+                cv = json.loads(content) if isinstance(content, str) else content
             except Exception:
-                content_val = content
+                cv = content
             messages.append(Message.tool_result_message(ToolResult(
-                tool_call_id=m.get("tool_call_id", ""),
-                name=m.get("name", "tool"),
-                content=content_val,
-            )))
-
+                tool_call_id=m.get("tool_call_id", ""), name=m.get("name", "tool"), content=cv)))
     return messages, system_prompt
 
 
@@ -166,275 +166,249 @@ def _parse_tools(raw: Optional[List[Dict[str, Any]]]):
     tools = []
     for t in raw:
         if t.get("type") == "function":
-            func = t.get("function", {})
+            fn = t.get("function", {})
             tools.append(Tool(definition=ToolDefinition(
-                name=func.get("name", ""),
-                description=func.get("description", ""),
-                input_schema=func.get("parameters", {"type": "object", "properties": {}}),
-            )))
+                name=fn.get("name", ""), description=fn.get("description", ""),
+                input_schema=fn.get("parameters", {"type": "object", "properties": {}}))))
     return tools or None
 
 
 def _format_tool_calls(tool_calls) -> List[Dict]:
     if not tool_calls:
         return []
-    return [{
-        "id": str(tc.id),
-        "type": "function",
-        "function": {"name": str(tc.name), "arguments": json.dumps(tc.arguments)},
-    } for tc in tool_calls]
+    return [{"id": str(tc.id), "type": "function",
+             "function": {"name": str(tc.name), "arguments": json.dumps(tc.arguments)}}
+            for tc in tool_calls]
 
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
-
-class ChatRequest(BaseModel):
-    model: str
-    messages: List[Dict[str, Any]]
-    stream: Optional[bool] = False
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    seed: Optional[int] = None
-    system_prompt: Optional[str] = None
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Any] = None
-    frequency_penalty: Optional[float] = None
-    presence_penalty: Optional[float] = None
+def _prompt_fingerprint(messages: List[Dict[str, Any]]) -> str:
+    last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    body = json.dumps(last or {}, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(body.encode()).hexdigest()[:16]
 
 
-class AddAccountRequest(BaseModel):
-    account_id: str
-    provider: str
-    # Auth fields — supply what your provider needs
-    api_key: Optional[str] = None
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    session_key: Optional[str] = None
-    cookies: Optional[Dict[str, str]] = None
-    # Provider-specific
-    org_id: Optional[str] = None
-    device_id: Optional[str] = None
-    routing_hint: Optional[str] = None
-    project: Optional[str] = None
-    region: Optional[str] = None
-    profile_arn: Optional[str] = None
-    email: Optional[str] = None
-    expires_at: Optional[int] = None
-    chatgpt_account_id: Optional[str] = None
-    user_id: Optional[str] = None
-    at: Optional[str] = None
-    bl: Optional[str] = None
-    f_sid: Optional[str] = None
-    # Transport
-    base_url: Optional[str] = None
-    pool: Optional[str] = "custom"
-    priority: Optional[int] = 100
-    weight: Optional[int] = 1
-    timeout_ms: Optional[int] = 120000
-    impersonate: Optional[str] = None
-    proxy_url: Optional[str] = None
-    extra_headers: Optional[Dict[str, str]] = None
+# ── Chat completions ───────────────────────────────────────────────────────────
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatReq, request: Request, token: str = Depends(verify_token)):
+    """OpenAI-compatible chat — load-balanced, abuse-gated, optional history.
+    Responses are never cached."""
+    provider, model_name = resolve_model(req.model)
+    full = full_model_name(provider, model_name)
+    ip = _client_ip(request)
+
+    pool, action = _gate(request, token, provider, _prompt_fingerprint(req.messages))
+    if action == "throttle":
+        await asyncio.sleep(2)  # soft back-pressure on elevated abuse score
+
+    # History: prepend stored transcript + system prompt when continuing a thread.
+    convo_msgs: List[Dict[str, Any]] = []
+    stored_system = None
+    if req.conversation_id:
+        rec = history.get_or_create(token, req.conversation_id, system_prompt=req.system_prompt)
+        stored_system = rec.get("system_prompt")
+        convo_msgs = history.history_messages(token, req.conversation_id)
+
+    effective_raw = convo_msgs + req.messages
+    messages, sys_in = _parse_messages(effective_raw)
+    system_prompt = req.system_prompt or sys_in or stored_system
+    tools = _parse_tools(req.tools)
+
+    ident = f"{token}@{ip}"
+    started = time.time()
+
+    # Streaming: the generator owns the concurrency lease (inc here, dec in its finally).
+    if req.stream:
+        abuse.conc_inc(ident)
+        return await _stream_response(
+            token, ip, req, full, provider, messages, system_prompt, tools, ident)
+
+    # Non-streaming: lease scoped to this call.
+    abuse.conc_inc(ident)
+    try:
+        try:
+            resp = await generate_response(
+                token, req.model, messages, system_prompt, tools=tools,
+                temperature=req.temperature, max_tokens=req.max_tokens, seed=req.seed)
+        except NoAccountError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            abuse.record_error(token, ip)
+            record_request(full, token, ip, provider, "error",
+                           latency_ms=(time.time() - started) * 1000)
+            raise HTTPException(502, f"Generation failed: {e}")
+
+        content_text = _extract_text(resp)
+        oai_tcs = _format_tool_calls(resp.message.tool_calls)
+        finish = "tool_calls" if oai_tcs else (resp.finish_reason or "stop")
+
+        if req.conversation_id and req.store:
+            to_store = list(req.messages)
+            to_store.append({"role": "assistant", "content": content_text,
+                             "tool_calls": oai_tcs or None})
+            history.append_messages(token, req.conversation_id, to_store)
+
+        record_request(full, token, ip, provider, "ok", cached=False,
+                       latency_ms=(time.time() - started) * 1000,
+                       in_tokens=resp.usage.input_tokens or 0,
+                       out_tokens=resp.usage.output_tokens or 0)
+
+        return {
+            "id": f"chatcmpl-{secrets.token_hex(12)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "conversation_id": req.conversation_id,
+            "choices": [{"index": 0, "message": {
+                "role": "assistant",
+                "content": content_text or None,
+                "tool_calls": oai_tcs or None,
+            }, "finish_reason": finish}],
+            "usage": {
+                "prompt_tokens": resp.usage.input_tokens or 0,
+                "completion_tokens": resp.usage.output_tokens or 0,
+                "total_tokens": resp.usage.total_tokens or (
+                    (resp.usage.input_tokens or 0) + (resp.usage.output_tokens or 0)),
+            },
+        }
+    finally:
+        abuse.conc_dec(ident)
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+async def _stream_response(token, ip, req, full, provider, messages, system_prompt, tools, ident):
+    chat_id = f"chatcmpl-{secrets.token_hex(12)}"
+    created = int(time.time())
+    started = time.time()
 
-@app.get("/")
-def index():
-    return {
-        "service": "GravityAPI Gateway",
-        "version": "2.0.0",
-        "providers": len(PROVIDERS),
-        "free_providers": sorted(FREE_PROVIDERS),
-        "endpoints": {
-            "GET  /v1/models":                 "List all available models",
-            "GET  /v1/models/{provider}":      "List models for a specific provider",
-            "POST /v1/chat/completions":        "OpenAI-compatible chat completions",
-            "POST /v1/embeddings":             "Embeddings (windsurf/cursor)",
-            "POST /api/generate-key":          "Generate a new API key",
-            "POST /api/add":                   "Register a provider account",
-            "DELETE /api/accounts/{id}":       "Remove an account",
-            "GET  /api/accounts":              "List your registered accounts",
-            "GET  /api/providers":             "All supported providers + auth guide",
-            "GET  /api/metrics":               "Request analytics",
-            "GET  /docs":                      "Interactive documentation",
-        },
-    }
+    async def gen():
+        # First chunk announces the role (OpenAI shape).
+        yield _sse({"id": chat_id, "object": "chat.completion.chunk", "created": created,
+                    "model": req.model, "choices": [{"index": 0,
+                    "delta": {"role": "assistant"}, "finish_reason": None}]})
+        collected = []
+        try:
+            async for piece in generate_stream(
+                token, req.model, messages, system_prompt, tools=tools,
+                temperature=req.temperature, max_tokens=req.max_tokens):
+                collected.append(piece)
+                yield _sse({"id": chat_id, "object": "chat.completion.chunk", "created": created,
+                            "model": req.model, "choices": [{"index": 0,
+                            "delta": {"content": piece}, "finish_reason": None}]})
+            yield _sse({"id": chat_id, "object": "chat.completion.chunk", "created": created,
+                        "model": req.model, "choices": [{"index": 0, "delta": {},
+                        "finish_reason": "stop"}]})
+            yield "data: [DONE]\n\n"
+            if req.conversation_id and req.store:
+                txt = "".join(collected)
+                history.append_messages(token, req.conversation_id,
+                                        list(req.messages) + [{"role": "assistant", "content": txt}])
+            record_request(full, token, ip, provider, "ok",
+                           latency_ms=(time.time() - started) * 1000)
+        except Exception as e:
+            abuse.record_error(token, ip)
+            record_request(full, token, ip, provider, "error",
+                           latency_ms=(time.time() - started) * 1000)
+            yield _sse({"id": chat_id, "object": "chat.completion.chunk", "created": created,
+                        "model": req.model, "choices": [{"index": 0,
+                        "delta": {"content": f"[Error: {e}]"}, "finish_reason": "error"}]})
+            yield "data: [DONE]\n\n"
+        finally:
+            abuse.conc_dec(ident)  # released here for the streaming path
 
+    # conc was incremented by caller; hand ownership to the generator's finally.
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"x-accel-buffering": "no", "cache-control": "no-cache"})
+
+
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+def _extract_text(resp) -> str:
+    c = resp.message.content
+    if isinstance(c, str):
+        return c
+    if hasattr(c, "text"):
+        return c.text
+    return str(c or "")
+
+
+# ── Models ──────────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
 def list_models(token: str = Depends(verify_token)):
     now = int(time.time())
-    models = []
+    data = []
     for pname, meta in PROVIDERS.items():
         for m in meta["models"]:
-            models.append({
-                "id": f"{pname}/{m}",
-                "object": "model",
-                "created": now,
-                "owned_by": pname,
-                "provider": pname,
-                "category": meta["category"],
-                "tool_support": meta["tool_support"],
-                "requires_account": meta["requires_custom_account"],
-            })
-    return {"object": "list", "data": models}
+            data.append({"id": f"{pname}/{m}", "object": "model", "created": now,
+                         "owned_by": pname, "provider": pname,
+                         "tool_support": meta["tool_support"],
+                         "requires_account": meta["requires_custom_account"]})
+    return {"object": "list", "data": data}
 
 
 @app.get("/v1/models/{provider}")
-async def list_provider_models(
-    provider: str,
-    live: bool = Query(False, description="Discover models live from the provider's own endpoint"),
-    token: str = Depends(verify_token),
-):
+async def list_provider_models(provider: str, live: bool = Query(False),
+                               token: str = Depends(verify_token)):
     provider = provider.lower()
     if provider not in PROVIDERS:
         raise HTTPException(404, f"Unknown provider: {provider!r}")
     meta = PROVIDERS[provider]
     now = int(time.time())
-    from llm import list_models_for_provider
     models = await list_models_for_provider(token, provider, live=live)
     return {
-        "object": "list",
-        "provider": provider,
-        "display_name": meta["display_name"],
-        "tool_support": meta["tool_support"],
+        "object": "list", "provider": provider, "display_name": meta["display_name"],
         "requires_account": meta["requires_custom_account"],
         "discovery": "live" if live else "catalog",
-        "data": [
-            {
-                "id": m["id"],
-                "object": "model",
-                "created": now,
-                "owned_by": provider,
-                "display_name": m.get("display_name"),
-                "description": m.get("description"),
-                "tags": m.get("tags", []),
-            }
-            for m in models
-        ],
+        "data": [{"id": m["id"], "object": "model", "created": now, "owned_by": provider,
+                  "display_name": m.get("display_name"), "description": m.get("description"),
+                  "tags": m.get("tags", [])} for m in models],
     }
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest, request: Request, token: str = Depends(verify_token)):
-    """OpenAI-compatible chat completions — all 40+ providers, streaming, tools, MFC."""
-    provider, model_name = resolve_model(req.model)
-    full = full_model_name(provider, model_name)
-    check_rate_limit(request.client.host, token, provider)
-    record_request(full, token)
+# ── Conversations (history management) ─────────────────────────────────────────
 
-    messages, sys_prompt = _parse_messages(req.messages)
-    system_prompt = req.system_prompt or sys_prompt
-    tools = _parse_tools(req.tools)
-
-    if req.stream:
-        async def _stream():
-            chat_id = f"chatcmpl-{secrets.token_hex(12)}"
-            created = int(time.time())
-            try:
-                async for chunk in generate_stream(
-                    token, req.model, messages, system_prompt,
-                    tools=tools, temperature=req.temperature, max_tokens=req.max_tokens,
-                ):
-                    yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
-                yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': f'[Error: {e}]'}, 'finish_reason': 'error'}]})}\n\n"
-                yield "data: [DONE]\n\n"
-        return StreamingResponse(_stream(), media_type="text/event-stream")
-
-    try:
-        resp = await generate_response(
-            token, req.model, messages, system_prompt,
-            tools=tools, temperature=req.temperature,
-            max_tokens=req.max_tokens, seed=req.seed,
-        )
-    except Exception as e:
-        raise HTTPException(500, f"Generation failed: {e}")
-
-    # Extract content
-    if isinstance(resp.message.content, str):
-        content_text = resp.message.content
-    elif hasattr(resp.message.content, "text"):
-        content_text = resp.message.content.text
-    else:
-        content_text = str(resp.message.content or "")
-
-    oai_tcs = _format_tool_calls(resp.message.tool_calls)
-    finish = "tool_calls" if oai_tcs else (resp.finish_reason or "stop")
-
-    return {
-        "id": f"chatcmpl-{secrets.token_hex(12)}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content_text or None,
-                "tool_calls": oai_tcs if oai_tcs else None,
-            },
-            "finish_reason": finish,
-        }],
-        "usage": {
-            "prompt_tokens": resp.usage.input_tokens or 0,
-            "completion_tokens": resp.usage.output_tokens or 0,
-            "total_tokens": resp.usage.total_tokens or (
-                (resp.usage.input_tokens or 0) + (resp.usage.output_tokens or 0)
-            ),
-        },
-    }
+@app.post("/v1/conversations")
+def create_conversation(payload: Dict[str, Any] = None, token: str = Depends(verify_token)):
+    payload = payload or {}
+    rec = history.create_conversation(
+        token, system_prompt=payload.get("system_prompt"), title=payload.get("title"))
+    return rec
 
 
-@app.post("/v1/embeddings")
-async def embeddings(payload: Dict[str, Any], token: str = Depends(verify_token)):
-    """Native embeddings via windsurf or cursor (1024-dim float32)."""
-    model = payload.get("model", "windsurf/swe-1-6-fast")
-    input_data = payload.get("input", [])
-    if isinstance(input_data, str):
-        input_data = [input_data]
-
-    provider, _ = resolve_model(model)
-    check_rate_limit("127.0.0.1", token, provider)
-    record_request(model, token)
-
-    try:
-        from gravity import AsyncGravityClient
-        from llm import _build_accounts_file
-        accounts = _build_accounts_file(token, provider)
-        client = AsyncGravityClient(accounts=accounts)
-        result = await client.embeddings(model=model, texts=input_data)
-        return {
-            "object": "list",
-            "model": model,
-            "data": [
-                {"object": "embedding", "index": i, "embedding": emb}
-                for i, emb in enumerate(result.embeddings)
-            ],
-            "usage": {"prompt_tokens": 0, "total_tokens": 0},
-        }
-    except Exception as e:
-        raise HTTPException(500, f"Embeddings failed: {e}")
+@app.get("/v1/conversations")
+def list_conversations(token: str = Depends(verify_token)):
+    return {"conversations": history.list_conversations(token)}
 
 
-# ── Account management ────────────────────────────────────────────────────────
+@app.get("/v1/conversations/{conv_id}")
+def get_conversation(conv_id: str, token: str = Depends(verify_token)):
+    rec = history.get_conversation(token, conv_id)
+    if rec is None:
+        raise HTTPException(404, "Conversation not found.")
+    return rec
+
+
+@app.delete("/v1/conversations/{conv_id}")
+def delete_conversation(conv_id: str, token: str = Depends(verify_token)):
+    if not history.delete_conversation(token, conv_id):
+        raise HTTPException(404, "Conversation not found.")
+    return {"status": "deleted", "id": conv_id}
+
+
+# ── Account management ─────────────────────────────────────────────────────────
 
 @app.post("/api/generate-key")
 def generate_key_endpoint():
     key = generate_api_key()
-    return {
-        "api_key": key,
-        "tier": "default",
-        "limits": {"shared_pool": "20 req/hr", "custom_pool": "2000 req/hr"},
-        "free_providers": sorted(FREE_PROVIDERS),
-        "next_steps": "POST /api/add to register provider accounts, GET /api/providers for details.",
-    }
+    return {"api_key": key, "tier": "default",
+            "limits": {"shared_pool": "20 req/hr", "custom_pool": "2000 req/hr"},
+            "free_providers": sorted(FREE_PROVIDERS)}
 
 
 @app.post("/api/add")
 def add_account(req: AddAccountRequest, token: str = Depends(verify_token)):
-    """Register any of the 40+ providers. See GET /api/providers for auth requirements."""
     payload = req.model_dump(exclude_none=True)
     try:
         return add_account_to_db(token, payload)
@@ -445,11 +419,7 @@ def add_account(req: AddAccountRequest, token: str = Depends(verify_token)):
 
 
 @app.delete("/api/accounts/{account_id}")
-def delete_account(
-    account_id: str,
-    provider: str = Query(..., description="Provider name, e.g. groq"),
-    token: str = Depends(verify_token),
-):
+def delete_account(account_id: str, provider: str = Query(...), token: str = Depends(verify_token)):
     result = remove_account_from_db(token, account_id, provider)
     if result["status"] == "not_found":
         raise HTTPException(404, "Account not found.")
@@ -458,51 +428,53 @@ def delete_account(
 
 @app.get("/api/accounts")
 def get_accounts(token: str = Depends(verify_token)):
-    return {
-        "accounts": list_accounts_for_key(token),
-        "registered_providers": sorted(get_providers_for_key(token)),
-    }
+    return {"accounts": list_accounts_for_key(token),
+            "registered_providers": sorted(get_providers_for_key(token))}
 
 
 @app.get("/api/providers")
 def get_providers():
-    """Full provider catalog with auth requirements."""
-    result = []
-    for name, meta in PROVIDERS.items():
-        result.append({
-            "id": name,
-            "display_name": meta["display_name"],
-            "category": meta["category"],
-            "description": meta["description"],
-            "auth_kinds": meta["auth_kinds"],
-            "tool_support": meta["tool_support"],
-            "structured_output": meta["structured_output"],
-            "supports_system_prompt": meta["supports_system_prompt"],
-            "requires_account": meta["requires_custom_account"],
-            "free": not meta["requires_custom_account"],
-            "default_base_url": meta["default_base_url"] or None,
-            "models": meta["models"],
-        })
-    return {
-        "total": len(result),
-        "free_providers": sorted(FREE_PROVIDERS),
-        "providers": result,
-    }
+    result = [{
+        "id": n, "display_name": m["display_name"], "category": m["category"],
+        "description": m["description"], "auth_kinds": m["auth_kinds"],
+        "tool_support": m["tool_support"], "requires_account": m["requires_custom_account"],
+        "free": not m["requires_custom_account"], "models": m["models"],
+    } for n, m in PROVIDERS.items()]
+    return {"total": len(result), "free_providers": sorted(FREE_PROVIDERS), "providers": result}
 
+
+# ── Ops: metrics, balancer, abuse, cache ───────────────────────────────────────
 
 @app.get("/api/metrics")
 def metrics(token: str = Depends(verify_token)):
-    return get_metrics()
+    m = get_metrics()
+    m["cache"] = cache.stats()
+    return m
+
+
+@app.get("/api/balancer")
+def balancer_health(token: str = Depends(verify_token)):
+    from account import get_db
+    return {"accounts": balancer.health_snapshot(get_db(), token)}
+
+
+@app.get("/api/abuse")
+def abuse_status(request: Request, token: str = Depends(verify_token)):
+    return abuse.status(token, _client_ip(request))
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "version": "3.0.0", "providers": len(PROVIDERS)}
 
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
 @app.post("/admin/generate-key")
 def admin_generate_key(payload: Dict[str, Any], token: str = Depends(verify_admin)):
-    tier = payload.get("tier", "default")
-    label = payload.get("label", "")
-    key = generate_api_key(label=label, tier=tier)
-    return {"api_key": key, "tier": tier, "label": label}
+    return {"api_key": generate_api_key(label=payload.get("label", ""),
+                                        tier=payload.get("tier", "default")),
+            "tier": payload.get("tier", "default")}
 
 
 @app.post("/admin/revoke-key")
@@ -513,88 +485,40 @@ def admin_revoke_key(payload: Dict[str, Any], token: str = Depends(verify_admin)
     return {"status": "revoked" if revoke_api_key(key) else "not_found"}
 
 
-# ── Docs ──────────────────────────────────────────────────────────────────────
+@app.post("/admin/ban")
+def admin_ban(payload: Dict[str, Any], token: str = Depends(verify_admin)):
+    api_key = payload.get("api_key", "")
+    ip = payload.get("ip", "*")
+    banned = payload.get("banned", True)
+    if not api_key:
+        raise HTTPException(400, "Missing api_key")
+    abuse.hard_ban(api_key, ip, banned)
+    return {"status": "banned" if banned else "unbanned", "api_key": api_key, "ip": ip}
 
-@app.get("/docs", response_class=HTMLResponse)
-def documentation():
-    try:
-        with open("./docs/api_guide.md", encoding="utf-8") as f:
-            md = f.read()
-    except Exception:
-        md = ""
 
-    provider_rows = "\n".join(
-        f"| `{n}` | {m['display_name']} | {m['category']} | "
-        f"{'✓ free' if not m['requires_custom_account'] else 'own key'} | "
-        f"{m['tool_support']} |"
-        for n, m in PROVIDERS.items()
-    )
-    providers_section = f"""
-## Supported Providers ({len(PROVIDERS)} total, {len(FREE_PROVIDERS)} free)
+# ── Root ──────────────────────────────────────────────────────────────────────
 
-| ID | Name | Category | Access | Tools |
-|----|------|----------|--------|-------|
-{provider_rows}
-
-**Free providers** (no account needed): {', '.join(f'`{p}`' for p in sorted(FREE_PROVIDERS))}
-
-### Adding an account
-
-```python
-import requests
-r = requests.post("https://your-server/api/add",
-    headers={{"Authorization": "Bearer grav_your_key"}},
-    json={{
-        "account_id": "my_groq",
-        "provider": "groq",
-        "api_key": "gsk_...",
-    }})
-```
-
-### Chat example
-
-```python
-import requests
-r = requests.post("https://your-server/v1/chat/completions",
-    headers={{"Authorization": "Bearer grav_your_key"}},
-    json={{
-        "model": "groq/llama-3.3-70b-versatile",
-        "messages": [{{"role": "user", "content": "Hello!"}}],
-    }})
-print(r.json()["choices"][0]["message"]["content"])
-```
-"""
-    full_md = providers_section + "\n\n" + md
-
-    return HTMLResponse(f"""<!DOCTYPE html><html lang="en"><head>
-<meta charset="UTF-8"><title>GravityAPI v2 Docs</title>
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet"/>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
-<style>:root{{--bg:#080911;--panel:rgba(17,19,36,.75);--border:rgba(255,255,255,.08);--purple:#8b5cf6;--cyan:#06b6d4;--text:#f3f4f6;--muted:#9ca3af}}
-*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;background-image:radial-gradient(at 0% 0%,rgba(139,92,246,.12) 0,transparent 50%),radial-gradient(at 100% 100%,rgba(6,182,212,.12) 0,transparent 50%)}}
-header{{padding:1.5rem 2rem;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);backdrop-filter:blur(12px);position:sticky;top:0;z-index:100;background:rgba(8,9,17,.8)}}
-.logo{{font-weight:700;font-size:1.8rem;background:linear-gradient(135deg,#8b5cf6,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
-.container{{max-width:1100px;margin:0 auto;padding:2rem}}.panel{{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:2.5rem;backdrop-filter:blur(16px)}}
-#doc h1,#doc h2,#doc h3{{font-weight:700;margin-top:2rem;margin-bottom:1rem;color:#fff;border-bottom:1px solid rgba(255,255,255,.05);padding-bottom:.5rem}}
-#doc h1{{font-size:2rem}}#doc h2{{font-size:1.5rem}}#doc h3{{font-size:1.2rem}}#doc p{{line-height:1.7;color:#d1d5db;margin-bottom:1.25rem;font-size:.95rem}}
-#doc ul,#doc ol{{margin-bottom:1.5rem;padding-left:1.5rem;color:#d1d5db;font-size:.95rem}}
-#doc table{{width:100%;border-collapse:collapse;margin:1.5rem 0;font-size:.83rem}}
-#doc th,#doc td{{padding:.55rem .75rem;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}}
-#doc th{{color:var(--muted);font-weight:600;background:rgba(255,255,255,.02)}}
-#doc code{{font-family:'JetBrains Mono',monospace;background:rgba(255,255,255,.06);padding:.2rem .4rem;border-radius:4px;color:#67e8f9;font-size:.85em}}
-#doc pre{{background:#05060b!important;border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin:1.5rem 0;overflow-x:auto}}
-#doc pre code{{background:transparent;padding:0;color:inherit}}</style></head><body>
-<header><div><div class="logo">🌌 GravityAPI</div><div style="color:var(--muted);font-size:.85rem">v2.0 · {len(PROVIDERS)} providers</div></div>
-<a href="/api/providers" style="color:var(--cyan);text-decoration:none;font-size:.85rem">providers JSON →</a></header>
-<div class="container"><div class="panel"><div id="doc"></div></div></div>
-<textarea id="md" style="display:none">{full_md.replace(chr(96), "&#96;")}</textarea>
-<script>
-document.getElementById("doc").innerHTML=marked.parse(document.getElementById("md").value.replace(/&#96;/g,"`"));
-document.querySelectorAll("#doc pre code").forEach(b=>Prism.highlightElement(b));
-</script></body></html>""")
+@app.get("/")
+def index():
+    return {
+        "service": "GravityAPI Gateway", "version": "3.0.0",
+        "providers": len(PROVIDERS), "free_providers": sorted(FREE_PROVIDERS),
+        "storage": {"index": "RocksDB", "bulk": "DuckDB"},
+        "features": ["load-balancer", "failover", "abuse-detection",
+                     "conversation-history", "http3", "streaming"],
+        "endpoints": {
+            "POST /v1/chat/completions": "chat (stream + non-stream, history, balanced)",
+            "GET  /v1/models[/{provider}?live=]": "model catalog / live discovery",
+            "POST /v1/conversations": "create conversation",
+            "GET/DELETE /v1/conversations/{id}": "fetch / delete conversation",
+            "POST /api/add": "register a provider account",
+            "GET  /api/accounts": "your accounts",
+            "GET  /api/providers": "provider catalog",
+            "GET  /api/metrics": "analytics (DuckDB)",
+            "GET  /api/balancer": "account health",
+            "GET  /api/abuse": "your abuse score",
+        },
+    }
 
 
 if __name__ == "__main__":
