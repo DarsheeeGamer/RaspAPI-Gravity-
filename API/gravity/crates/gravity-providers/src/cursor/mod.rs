@@ -21,6 +21,7 @@ use gravity_http::{HttpRequest, Profile};
 
 const STREAM_URL: &str = "https://api2.cursor.sh/aiserver.v1.InferenceService/Stream";
 const EMBED_URL: &str = "https://api2.cursor.sh/aiserver.v1.AiService/BulkEmbed";
+const MODELS_URL: &str = "https://api2.cursor.sh/aiserver.v1.AiService/GetUsableModels";
 
 /// The Cursor adapter.
 pub struct CursorProvider {
@@ -105,6 +106,72 @@ impl Provider for CursorProvider {
 
     fn list_models(&self) -> Vec<String> {
         ["claude-4.5-sonnet", "gpt-5", "auto"].iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Discover models via `AiService/GetUsableModels` (the call the IDE makes
+    /// to populate its model dropdown). Empty proto request body; the response
+    /// is `field 1 = repeated model`, each model's `field 1 = name string`.
+    /// Falls back to the static list on any failure.
+    async fn discover_models(&self, ctx: &ChatCtx<'_>) -> Result<Vec<gravity_core::ModelInfo>> {
+        use gravity_core::ModelInfo;
+        let fallback = || self.list_models().into_iter().map(ModelInfo::bare).collect::<Vec<_>>();
+        if ctx.secret.is_empty() {
+            return Ok(fallback());
+        }
+
+        let machine_id = ctx
+            .account
+            .auth
+            .inline_secret("machine_id")
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid_v4(ctx.env));
+        let checksum = match ctx.account.auth.inline_secret("checksum") {
+            Some(c) => c.to_owned(),
+            None => match ctx.account.auth.inline_secret("mac_machine_id") {
+                Some(mac) => format!("{}{}/{}", checksum_prefix(ctx.env), machine_id, mac),
+                None => format!("{}{}", checksum_prefix(ctx.env), machine_id),
+            },
+        };
+
+        let req = HttpRequest::post(MODELS_URL)
+            .profile(Profile::from_name(ctx.impersonate_or("chrome")))
+            .timeout_ms(ctx.timeout_ms())
+            .proxy(ctx.proxy())
+            .header("content-type", "application/proto")
+            .header("connect-protocol-version", "1")
+            .header("authorization", format!("Bearer {}", ctx.secret))
+            .header("x-cursor-checksum", checksum)
+            .header("x-cursor-client-version", "3.1.17")
+            .header("x-cursor-client-type", "ide")
+            .header("user-agent", "Cursor/1.0.0")
+            .body(bytes::Bytes::new());
+
+        let resp = match ctx.http.send(req).await {
+            Ok(r) if r.is_success() => r,
+            _ => return Ok(fallback()),
+        };
+        let fields = proto::decode_fields(&resp.body);
+        let mut out: Vec<ModelInfo> = Vec::new();
+        if let Some(models) = fields.get(&1) {
+            for m in models {
+                let Some(inner_bytes) = m.bytes() else { continue };
+                let inner = proto::decode_fields(inner_bytes);
+                if let Some(name_field) = inner.get(&1).and_then(|v| v.first()) {
+                    if let Some(nb) = name_field.bytes() {
+                        if let Ok(name) = std::str::from_utf8(nb) {
+                            if !name.is_empty() {
+                                out.push(ModelInfo::bare(name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            Ok(fallback())
+        } else {
+            Ok(out)
+        }
     }
 
     /// Embed texts via `AiService/BulkEmbed` (3072-dim float64, Connect-RPC proto).

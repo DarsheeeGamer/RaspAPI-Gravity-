@@ -101,6 +101,51 @@ impl<C: OaiConfig> Provider for OpenAiCompatProvider<C> {
         self.config.models()
     }
 
+    /// Fetch models from the OpenAI-compatible `GET /models` endpoint
+    /// (`{"data":[{"id":...}]}`), falling back to the static catalog on failure.
+    async fn discover_models(&self, ctx: &ChatCtx<'_>) -> Result<Vec<gravity_core::ModelInfo>> {
+        use gravity_core::ModelInfo;
+        let fallback = || self.config.models().into_iter().map(ModelInfo::bare).collect::<Vec<_>>();
+
+        let url = format!("{}/models", self.base_url(ctx).trim_end_matches('/'));
+        let mut req = HttpRequest::get(url)
+            .profile(self.profile(ctx))
+            .timeout_ms(ctx.timeout_ms())
+            .proxy(ctx.proxy());
+        if !ctx.secret.is_empty() && ctx.account.auth.kind.as_ref() != "anonymous" {
+            let (k, v) = self.config.auth_header(ctx.secret);
+            req = req.header(k, v);
+        }
+        let mut extra = Vec::new();
+        self.config.extra_headers(&mut extra);
+        for (k, v) in extra {
+            req = req.header(k, v);
+        }
+
+        let resp = match ctx.http.send(req).await {
+            Ok(r) if r.is_success() => r,
+            _ => return Ok(fallback()),
+        };
+        let parsed: Value = match serde_json::from_slice(&resp.body) {
+            Ok(v) => v,
+            Err(_) => return Ok(fallback()),
+        };
+        let arr = parsed.get("data").and_then(Value::as_array);
+        let models: Vec<ModelInfo> = match arr {
+            Some(items) => items
+                .iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str))
+                .map(ModelInfo::bare)
+                .collect(),
+            None => return Ok(fallback()),
+        };
+        if models.is_empty() {
+            Ok(fallback())
+        } else {
+            Ok(models)
+        }
+    }
+
     async fn chat(&self, ctx: &ChatCtx<'_>) -> Result<ChatResponse> {
         let req = self.build_http_request(ctx, false)?;
         let resp = ctx.http.send(req).await?;

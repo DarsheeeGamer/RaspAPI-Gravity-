@@ -168,18 +168,62 @@ async def generate_stream(
         yield token
 
 
-async def list_models_for_provider(api_key: str, provider: str) -> List[str]:
-    """Try to fetch dynamic model list from a provider; fall back to catalog."""
-    catalog_models = PROVIDERS.get(provider, {}).get("models", [])
+async def list_models_for_provider(api_key: str, provider: str, live: bool = False) -> List[dict]:
+    """List models for a provider.
+
+    When ``live`` is set, attempt dynamic discovery from the provider's own
+    model-list endpoint (Cursor GetUsableModels, ChatGPT /backend-api/models,
+    Gemini otAQ7b RPC, GLM /api/models, or OpenAI-compatible /models) via the
+    Rust gravity core, falling back to the static catalog on any failure.
+
+    Returns a list of ``{"id","model","display_name","description","tags"}``.
+    """
+    catalog = [
+        {"id": f"{provider}/{m}", "model": m, "display_name": None,
+         "description": None, "tags": []}
+        for m in PROVIDERS.get(provider, {}).get("models", [])
+    ]
+    if not live:
+        return catalog
+
+    # 1. Preferred: Rust gravity core (real reverse-engineered discovery).
+    secret = _first_secret_for(api_key, provider)
+    try:
+        import gravity_rs  # PyO3 wheel from API/gravity (gravity-pyo3)
+        discovered = await asyncio.to_thread(gravity_rs.discover_models, provider, secret or "")
+        if discovered:
+            return discovered
+    except Exception:
+        pass
+
+    # 2. Fallback: Python gravity adapter list_models (mostly static).
     try:
         accounts = _build_accounts_file(api_key, provider)
         client = AsyncGravityClient(accounts=accounts)
-        dynamic = await asyncio.wait_for(
-            client.list_models(provider),
-            timeout=5.0,
-        )
+        dynamic = await asyncio.wait_for(client.list_models(provider), timeout=8.0)
         if dynamic:
-            return dynamic
+            return [
+                {"id": f"{provider}/{m}", "model": m, "display_name": None,
+                 "description": None, "tags": []}
+                for m in dynamic
+            ]
     except Exception:
         pass
-    return catalog_models
+
+    return catalog
+
+
+def _first_secret_for(api_key: str, provider: str) -> str:
+    """Resolve the first usable secret for a provider from the user's accounts."""
+    try:
+        accounts = load_accounts_for_key(api_key)
+        for bundle in accounts.emails:
+            for acc in bundle.providers:
+                if acc.provider.value == provider and acc.enabled:
+                    extra = acc.auth.extra or {}
+                    for key in ("api_key", "access_token", "session_key", "token"):
+                        if extra.get(key):
+                            return extra[key]
+    except Exception:
+        pass
+    return ""

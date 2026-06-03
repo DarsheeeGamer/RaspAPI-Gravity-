@@ -71,6 +71,61 @@ pub fn parse_chat_request(
     Ok((account, request))
 }
 
+/// Parse a `gravity_discover_models` request: a provider plus optional
+/// credentials/transport, building a transient account to discover over.
+pub fn parse_discover_request(
+    registry: &Registry,
+    body: &str,
+) -> Result<(ProviderName, ResolvedAccount)> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| Error::validation(format!("invalid request JSON: {e}"), "ffi_bad_json"))?;
+
+    let provider_str = string_field(&v, "provider")
+        .ok_or_else(|| Error::validation("missing 'provider'", "ffi_missing_provider"))?;
+    let provider = ProviderName::from_str(provider_str)
+        .map_err(|_| Error::validation(format!("unknown provider {provider_str:?}"), "ffi_unknown_provider"))?;
+
+    let secret = first_string(&v, &["api_key", "session_key", "token", "access_token"]).unwrap_or_default();
+    let kind = if secret.is_empty() {
+        Some("anonymous".to_owned())
+    } else if matches!(provider, ProviderName::Claude | ProviderName::Chatgpt | ProviderName::Gemini) {
+        Some("session_cookie".to_owned())
+    } else {
+        Some("api_key".to_owned())
+    };
+    let opts = TransientOptions {
+        secret,
+        kind,
+        base_url: string_field(&v, "base_url").map(str::to_owned),
+        impersonate: string_field(&v, "impersonate").map(str::to_owned),
+        proxy_url: string_field(&v, "proxy").or_else(|| string_field(&v, "proxy_url")).map(str::to_owned),
+        timeout_ms: v.get("timeout_ms").and_then(Value::as_u64).map(|n| n as u32),
+        device_id: string_field(&v, "device_id").map(str::to_owned),
+        org_id: string_field(&v, "org_id").map(str::to_owned),
+        extra: Metadata::new(),
+    };
+    let account = build_transient(registry, provider, opts)?;
+    Ok((provider, account))
+}
+
+/// Serialize discovered [`gravity_core::ModelInfo`]s into the FFI list JSON.
+pub fn models_to_json(provider: ProviderName, models: &[gravity_core::ModelInfo]) -> Value {
+    let data: Vec<Value> = models
+        .iter()
+        .map(|m| {
+            json!({
+                "id": format!("{}/{}", provider.as_str(), m.id),
+                "model": m.id,
+                "provider": provider.as_str(),
+                "display_name": m.display_name,
+                "description": m.description,
+                "tags": m.tags,
+            })
+        })
+        .collect();
+    json!({ "object": "list", "provider": provider.as_str(), "data": data })
+}
+
 fn parse_messages(value: Option<&Value>) -> Result<Vec<Message>> {
     let arr = value
         .and_then(Value::as_array)

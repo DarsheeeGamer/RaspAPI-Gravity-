@@ -280,21 +280,36 @@ def list_models(token: str = Depends(verify_token)):
 
 
 @app.get("/v1/models/{provider}")
-def list_provider_models(provider: str, token: str = Depends(verify_token)):
+async def list_provider_models(
+    provider: str,
+    live: bool = Query(False, description="Discover models live from the provider's own endpoint"),
+    token: str = Depends(verify_token),
+):
     provider = provider.lower()
     if provider not in PROVIDERS:
         raise HTTPException(404, f"Unknown provider: {provider!r}")
     meta = PROVIDERS[provider]
     now = int(time.time())
+    from llm import list_models_for_provider
+    models = await list_models_for_provider(token, provider, live=live)
     return {
         "object": "list",
         "provider": provider,
         "display_name": meta["display_name"],
         "tool_support": meta["tool_support"],
         "requires_account": meta["requires_custom_account"],
+        "discovery": "live" if live else "catalog",
         "data": [
-            {"id": f"{provider}/{m}", "object": "model", "created": now, "owned_by": provider}
-            for m in meta["models"]
+            {
+                "id": m["id"],
+                "object": "model",
+                "created": now,
+                "owned_by": provider,
+                "display_name": m.get("display_name"),
+                "description": m.get("description"),
+                "tags": m.get("tags", []),
+            }
+            for m in models
         ],
     }
 

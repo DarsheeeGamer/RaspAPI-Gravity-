@@ -135,6 +135,38 @@ pub extern "C" fn gravity_list_providers() -> *mut c_char {
     json_c_string(&convert::providers_list_json(gravity_providers::builtin()))
 }
 
+/// Discover a provider's models from its live endpoint (JSON in/out).
+///
+/// Request JSON: `{"provider":"groq","api_key":"…"}` (creds optional for
+/// providers that allow anonymous discovery). Returns
+/// `{"object":"list","provider":"…","data":[{"id":"provider/model","model":"…",
+/// "display_name":…,"description":…,"tags":[…]}]}`. Falls back to the static
+/// list when discovery can't reach the endpoint. Caller frees the result.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn gravity_discover_models(request_json: *const c_char) -> *mut c_char {
+    let Some(body) = c_str(request_json) else {
+        return json_c_string(&serde_json::json!({"error": "null or invalid request_json"}));
+    };
+    let eng = engine();
+    let registry = gravity_providers::builtin();
+    let value = match convert::parse_discover_request(registry, body) {
+        Ok((provider, account)) => {
+            match eng
+                .runtime
+                .block_on(eng.client.discover_models_over(provider, &account))
+            {
+                Ok(models) => convert::models_to_json(provider, &models),
+                Err(e) => convert::error_json(&e),
+            }
+        }
+        Err(e) => convert::error_json(&e),
+    };
+    json_c_string(&value)
+}
+
 /// Generate embeddings (JSON in/out). Currently returns a structured error for
 /// providers without embedding support; the ABI shape is preserved.
 ///

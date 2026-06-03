@@ -28,6 +28,12 @@ char* gravity_embeddings(const char* request_json);
 /* Provider discovery -> JSON array (caller frees). */
 char* gravity_list_providers(void);
 
+/* Model discovery: request_json {"provider":"…","api_key":"…"} ->
+ * {"object":"list","provider":"…","data":[{"id","model","display_name",…}]}
+ * Hits the provider's live model-list endpoint; falls back to the static list.
+ * (caller frees). */
+char* gravity_discover_models(const char* request_json);
+
 /* Callback streaming. Blocks; callback invoked per token (token valid only
  * during the call). Returns 0 on success, -1 on error. */
 typedef void (*gravity_token_cb)(const char* token, void* userdata);

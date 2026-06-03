@@ -35,6 +35,7 @@ pub mod error;
 pub mod message;
 pub mod metadata;
 pub mod model_id;
+pub mod model_info;
 pub mod request;
 pub mod response;
 pub mod schema;
@@ -64,6 +65,7 @@ pub use error::{Error, ProviderError, ProviderErrorKind, Result};
 pub use message::{Content, ContentPart, ImageUrl, InputFile, Message, Role};
 pub use metadata::Metadata;
 pub use model_id::{ModelId, ModelIdParseError};
+pub use model_info::ModelInfo;
 pub use request::{ChatRequest, FunctionCalling, ResponseFormat, Sampling};
 pub use response::{
     ChatResponse, EmbeddingResponse, FinishReason, GeneratedImage, ImageRequest, ImageResponse,

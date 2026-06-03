@@ -196,6 +196,59 @@ fn list_providers(py: Python<'_>) -> PyResult<Py<PyList>> {
     Ok(list.unbind())
 }
 
+/// Discover a provider's models from its live endpoint.
+///
+/// Returns a list of dicts: `{id, model, provider, display_name, description,
+/// tags}` where `id` is `"provider/model"`. Credentials are optional for
+/// providers that allow anonymous discovery; falls back to the static list when
+/// the endpoint is unreachable.
+///
+/// ```python
+/// for m in gravity_rs.discover_models("groq", api_key="gsk_..."):
+///     print(m["id"], m.get("display_name"))
+/// ```
+#[pyfunction]
+#[pyo3(signature = (provider, api_key = ""))]
+fn discover_models(py: Python<'_>, provider: &str, api_key: &str) -> PyResult<Py<PyList>> {
+    let pname = ProviderName::from_str(provider)
+        .map_err(|_| PyValueError::new_err(format!("unknown provider: {provider}")))?;
+    let kind = if api_key.is_empty() {
+        Some("anonymous".to_owned())
+    } else if matches!(
+        pname,
+        ProviderName::Claude | ProviderName::Chatgpt | ProviderName::Gemini
+    ) {
+        Some("session_cookie".to_owned())
+    } else {
+        Some("api_key".to_owned())
+    };
+    let account = build_transient(
+        gravity_providers::builtin(),
+        pname,
+        TransientOptions { secret: api_key.to_owned(), kind, ..Default::default() },
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    let eng = engine();
+    let result = py.detach(|| {
+        eng.runtime.block_on(eng.client.discover_models_over(pname, &account))
+    });
+    let models = result.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    let list = PyList::empty(py);
+    for m in &models {
+        let d = PyDict::new(py);
+        d.set_item("id", format!("{}/{}", pname.as_str(), m.id))?;
+        d.set_item("model", &m.id)?;
+        d.set_item("provider", pname.as_str())?;
+        d.set_item("display_name", m.display_name.as_deref())?;
+        d.set_item("description", m.description.as_deref())?;
+        d.set_item("tags", m.tags.clone())?;
+        list.append(d)?;
+    }
+    Ok(list.unbind())
+}
+
 /// Run a blocking chat and return a response dict.
 ///
 /// The dict contains: `content`, `model`, `finish_reason`, `input_tokens`,
@@ -355,5 +408,6 @@ fn gravity_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(list_providers, m)?)?;
     m.add_function(wrap_pyfunction!(chat, m)?)?;
     m.add_function(wrap_pyfunction!(chat_stream, m)?)?;
+    m.add_function(wrap_pyfunction!(discover_models, m)?)?;
     Ok(())
 }

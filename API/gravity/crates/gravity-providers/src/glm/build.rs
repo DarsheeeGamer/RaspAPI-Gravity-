@@ -9,6 +9,9 @@ use serde_json::{json, Map, Value};
 
 /// chat.z.ai endpoints.
 pub const COMPLETIONS_URL: &str = "https://chat.z.ai/api/v2/chat/completions";
+/// Model-list endpoint (OpenWebUI-style; the call chat.z.ai makes to populate
+/// its model picker). Returns `{"data":[{"id","name","info":{...}}]}`.
+pub const MODELS_URL: &str = "https://chat.z.ai/api/models";
 /// Default model.
 pub const DEFAULT_MODEL: &str = "glm-5";
 

@@ -4,7 +4,7 @@ use crate::context::ChatCtx;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use gravity_core::{
-    ChatResponse, Checkpoint, EmbeddingResponse, Error, ImageRequest, ImageResponse,
+    ChatResponse, Checkpoint, EmbeddingResponse, Error, ImageRequest, ImageResponse, ModelInfo,
     ProviderAccount, ProviderCapabilities, Result, StreamEvent,
 };
 
@@ -30,6 +30,20 @@ pub trait Provider: Send + Sync {
     /// Models this provider exposes without a network call (may be empty).
     fn list_models(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Discover models from the provider's live endpoint, returning rich
+    /// [`ModelInfo`] (id + display name + description + tags).
+    ///
+    /// The default falls back to [`Self::list_models`] mapped to bare ids (no
+    /// network). Providers whose web UI / API exposes a model-listing endpoint
+    /// override this to hit it — e.g. Cursor's `GetUsableModels`, ChatGPT's
+    /// `/backend-api/models`, Gemini's `otAQ7b` batchexecute RPC, GLM's
+    /// `/api/models`, or any OpenAI-compatible `GET /models`. On any network or
+    /// auth failure, override impls should fall back to the static list so the
+    /// call never hard-errors.
+    async fn discover_models(&self, _ctx: &ChatCtx<'_>) -> Result<Vec<ModelInfo>> {
+        Ok(self.list_models().into_iter().map(ModelInfo::bare).collect())
     }
 
     /// Adapt a system prompt for this provider. Default: trim, drop if empty.

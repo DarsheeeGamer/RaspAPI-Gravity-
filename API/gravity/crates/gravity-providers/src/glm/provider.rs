@@ -92,6 +92,57 @@ impl Provider for GlmProvider {
         build::models()
     }
 
+    /// Discover models from `GET /api/models` (chat.z.ai is OpenWebUI-based;
+    /// response is `{"data":[{"id","name"}]}`). Falls back to the static list.
+    async fn discover_models(&self, ctx: &ChatCtx<'_>) -> Result<Vec<gravity_core::ModelInfo>> {
+        use gravity_core::ModelInfo;
+        let fallback = || build::models().into_iter().map(ModelInfo::bare).collect::<Vec<_>>();
+
+        let mut req = HttpRequest::get(build::MODELS_URL)
+            .profile(gravity_http::Profile::from_name(ctx.impersonate_or("chrome")))
+            .timeout_ms(ctx.timeout_ms())
+            .proxy(ctx.proxy());
+        for (k, v) in build::default_headers() {
+            req = req.header(k, v);
+        }
+        if !ctx.secret.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", ctx.secret));
+        }
+        let resp = match ctx.http.send(req).await {
+            Ok(r) if r.is_success() => r,
+            _ => return Ok(fallback()),
+        };
+        let parsed: Value = match serde_json::from_slice(&resp.body) {
+            Ok(v) => v,
+            Err(_) => return Ok(fallback()),
+        };
+        // OpenWebUI returns {"data":[...]}; some deployments return a bare list.
+        let items = parsed
+            .get("data")
+            .and_then(Value::as_array)
+            .or_else(|| parsed.as_array());
+        let Some(items) = items else {
+            return Ok(fallback());
+        };
+        let out: Vec<ModelInfo> = items
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("id").and_then(Value::as_str)?;
+                Some(ModelInfo {
+                    id: id.to_owned(),
+                    display_name: m.get("name").and_then(Value::as_str).map(str::to_owned),
+                    description: None,
+                    tags: Vec::new(),
+                })
+            })
+            .collect();
+        if out.is_empty() {
+            Ok(fallback())
+        } else {
+            Ok(out)
+        }
+    }
+
     async fn chat(&self, ctx: &ChatCtx<'_>) -> Result<ChatResponse> {
         let req = self.build_request(ctx);
         let model_full = ctx.request.model.full_name();

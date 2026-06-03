@@ -347,6 +347,50 @@ impl AsyncGravityClient {
         provider.chat_stream(&ctx).await
     }
 
+    /// Discover a provider's available models over a specific resolved account
+    /// (hits the live model-listing endpoint; falls back to the static list).
+    pub async fn discover_models_over(
+        &self,
+        provider_name: ProviderName,
+        candidate: &ResolvedAccount,
+    ) -> Result<Vec<gravity_core::ModelInfo>> {
+        let provider = self.provider(provider_name)?;
+        // Discovery ignores the request model, but ChatRequest needs a valid
+        // ModelId, so use a harmless placeholder.
+        let model = gravity_core::ModelId::new(provider_name, "models")
+            .unwrap_or_else(|_| gravity_core::ModelId::new(ProviderName::OpenaiApi, "models").unwrap());
+        let request = ChatRequest::new(model, Vec::new());
+        let conversation = Conversation::new("model-discovery");
+        let ctx = self.ctx(&request, candidate, &conversation, None);
+        provider.discover_models(&ctx).await
+    }
+
+    /// Discover a provider's models, selecting an account from the manager
+    /// (or a synthetic anonymous account for providers that allow it).
+    pub async fn discover_models_with_manager(
+        &self,
+        manager: &Mutex<AccountManager>,
+        provider_name: ProviderName,
+    ) -> Result<Vec<gravity_core::ModelInfo>> {
+        // Pick the highest-priority account, resolving its secret under one lock.
+        let candidate: Option<ResolvedAccount> = {
+            let mgr = manager.lock().expect("account manager poisoned");
+            mgr.accounts_for(provider_name).into_iter().next().map(|a| {
+                let secret = mgr
+                    .resolve_secret(&a.auth)
+                    .map(|s| expose(&s).to_owned())
+                    .unwrap_or_default();
+                ResolvedAccount { account: a.clone(), secret }
+            })
+        };
+        let candidate = candidate
+            .or_else(|| anon_fallback(self.registry, provider_name))
+            .ok_or_else(|| {
+                Error::AccountSelection(format!("no usable accounts for provider {provider_name}"))
+            })?;
+        self.discover_models_over(provider_name, &candidate).await
+    }
+
     /// Build a [`ChatCtx`] for one provider call.
     fn ctx<'a>(
         &'a self,
@@ -782,6 +826,17 @@ impl GravityClient {
             }
             Ok(chunks)
         })
+    }
+
+    /// Blocking model discovery over a resolved account (hits the live
+    /// model-listing endpoint, falling back to the static list).
+    pub fn discover_models_over(
+        &self,
+        provider: ProviderName,
+        candidate: &ResolvedAccount,
+    ) -> Result<Vec<gravity_core::ModelInfo>> {
+        self.runtime
+            .block_on(self.inner.discover_models_over(provider, candidate))
     }
 
     /// Access the async client.

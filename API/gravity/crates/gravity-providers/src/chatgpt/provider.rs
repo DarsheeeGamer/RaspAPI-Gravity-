@@ -220,6 +220,61 @@ impl Provider for ChatgptProvider {
         ["gpt-5", "gpt-4o", "o4-mini", "auto"].iter().map(|s| s.to_string()).collect()
     }
 
+    /// Fetch the model picker list from `GET /backend-api/models`
+    /// (`{"models":[{"slug","title","description","tags"}]}`). Requires a
+    /// session token — anonymous accounts have no enumerable list, so they fall
+    /// back to the static set.
+    async fn discover_models(&self, ctx: &ChatCtx<'_>) -> Result<Vec<gravity_core::ModelInfo>> {
+        use gravity_core::ModelInfo;
+        let fallback = || self.list_models().into_iter().map(ModelInfo::bare).collect::<Vec<_>>();
+
+        // No token → anonymous; the /models endpoint is auth-only.
+        if ctx.secret.is_empty() {
+            return Ok(fallback());
+        }
+        let url = format!("{BACKEND_BASE}/models?history_and_training_disabled=false");
+        let mut req = HttpRequest::get(url)
+            .profile(Self::profile(ctx))
+            .timeout_ms(ctx.timeout_ms())
+            .proxy(ctx.proxy());
+        for (k, v) in Self::base_headers(ctx) {
+            req = req.header(k, v);
+        }
+        let resp = match ctx.http.send(req).await {
+            Ok(r) if r.is_success() => r,
+            _ => return Ok(fallback()),
+        };
+        let parsed: Value = match serde_json::from_slice(&resp.body) {
+            Ok(v) => v,
+            Err(_) => return Ok(fallback()),
+        };
+        let Some(models) = parsed.get("models").and_then(Value::as_array) else {
+            return Ok(fallback());
+        };
+        let out: Vec<ModelInfo> = models
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("slug").and_then(Value::as_str)?;
+                let tags = m
+                    .get("tags")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_owned)).collect())
+                    .unwrap_or_default();
+                Some(ModelInfo {
+                    id: id.to_owned(),
+                    display_name: m.get("title").and_then(Value::as_str).map(str::to_owned),
+                    description: m.get("description").and_then(Value::as_str).map(str::to_owned),
+                    tags,
+                })
+            })
+            .collect();
+        if out.is_empty() {
+            Ok(fallback())
+        } else {
+            Ok(out)
+        }
+    }
+
     /// Open a placeholder checkpoint so multi-turn conversation IDs can be
     /// threaded. The actual `conversation_id` is extracted from the first SSE
     /// response and stored by the caller in `Checkpoint.remote_conversation_id`.

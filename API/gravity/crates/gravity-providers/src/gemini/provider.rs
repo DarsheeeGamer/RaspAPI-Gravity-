@@ -227,6 +227,104 @@ impl Provider for GeminiProvider {
         build::models()
     }
 
+    /// Discover the account's available models via the `otAQ7b` GetUserStatus
+    /// batchexecute RPC (the same call the web UI makes to populate its model
+    /// picker). Each response entry is `[model_id_hex, display_name, description]`;
+    /// known hex ids are reverse-mapped to request-usable names. Falls back to
+    /// the static list on any failure (including anonymous sessions, which can't
+    /// enumerate beyond the base flash model).
+    async fn discover_models(&self, ctx: &ChatCtx<'_>) -> Result<Vec<gravity_core::ModelInfo>> {
+        use gravity_core::ModelInfo;
+        use parser::{nested, NestIndex};
+        let fallback = || build::models().into_iter().map(ModelInfo::bare).collect::<Vec<_>>();
+
+        let tokens = match self.bootstrap(ctx).await {
+            Ok(t) => t,
+            Err(_) => return Ok(fallback()),
+        };
+        let access_token = if tokens.access_token.is_empty() {
+            ctx.secret
+        } else {
+            &tokens.access_token
+        };
+
+        // f.req for a single-RPC batchexecute: [[["otAQ7b","[]",null,"generic"]]]
+        let f_req = format!(r#"[[["{}","[]",null,"generic"]]]"#, build::RPC_GET_USER_STATUS);
+        let mut url = format!(
+            "{}?rpcids={}&_reqid={}&rt=c",
+            build::BATCH_EXEC_URL,
+            build::RPC_GET_USER_STATUS,
+            build::reqid(ctx.env),
+        );
+        if let Some(sid) = &tokens.session_id {
+            url.push_str(&format!("&f.sid={}", urlencode(sid)));
+        }
+        if let Some(bl) = &tokens.build_label {
+            url.push_str(&format!("&bl={}", urlencode(bl)));
+        }
+        let body = if access_token.is_empty() {
+            format!("f.req={}", urlencode(&f_req))
+        } else {
+            format!("f.req={}&at={}", urlencode(&f_req), urlencode(access_token))
+        };
+        let mut req = HttpRequest::post(url)
+            .profile(Profile::from_name(ctx.impersonate_or("chrome")))
+            .timeout_ms(ctx.timeout_ms())
+            .proxy(ctx.proxy())
+            .cookie_store(true)
+            .header("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
+            .header("origin", "https://gemini.google.com")
+            .header("referer", "https://gemini.google.com/")
+            .header("x-same-domain", "1")
+            .header("user-agent", USER_AGENT);
+        let cookies = Self::cookie_header(ctx);
+        if !cookies.is_empty() {
+            req = req.header("cookie", cookies);
+        }
+        let req = req.body(bytes::Bytes::from(body));
+
+        let resp = match ctx.http.send(req).await {
+            Ok(r) if r.is_success() => r,
+            _ => return Ok(fallback()),
+        };
+        let frames = parser::extract_json_from_response(&resp.text());
+
+        // Each wrb.fr frame's [2] is a JSON string; parse it and read [15] =
+        // the models list, where each entry is [hex_id, display_name, desc].
+        let mut out: Vec<ModelInfo> = Vec::new();
+        for frame in &frames {
+            let Some(inner_str) = nested(frame, &[NestIndex::Idx(2)]).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(part) = serde_json::from_str::<serde_json::Value>(inner_str) else {
+                continue;
+            };
+            let Some(models) = nested(&part, &[NestIndex::Idx(15)]).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for m in models {
+                let Some(hex) = nested(m, &[NestIndex::Idx(0)]).and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let display = nested(m, &[NestIndex::Idx(1)]).and_then(|v| v.as_str());
+                let desc = nested(m, &[NestIndex::Idx(2)]).and_then(|v| v.as_str());
+                // Prefer a request-usable name; fall back to the hex id.
+                let id = build::model_name_for_id(hex).map(str::to_owned).unwrap_or_else(|| hex.to_owned());
+                out.push(ModelInfo {
+                    id,
+                    display_name: display.map(str::to_owned),
+                    description: desc.map(str::to_owned),
+                    tags: Vec::new(),
+                });
+            }
+        }
+        if out.is_empty() {
+            Ok(fallback())
+        } else {
+            Ok(out)
+        }
+    }
+
     async fn chat(&self, ctx: &ChatCtx<'_>) -> Result<ChatResponse> {
         let tokens = self.bootstrap(ctx).await?;
         let req = self.build_request(ctx, &tokens);

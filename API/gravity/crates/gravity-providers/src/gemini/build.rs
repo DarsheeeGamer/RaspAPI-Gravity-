@@ -12,6 +12,13 @@ use serde_json::{json, Value};
 pub const GENERATE_URL: &str =
     "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
 
+/// Generic `batchexecute` endpoint (used for the `otAQ7b` GetUserStatus RPC
+/// that returns the account's available-model list).
+pub const BATCH_EXEC_URL: &str = "https://gemini.google.com/_/BardChatUi/data/batchexecute";
+
+/// RPC id for `GetUserStatus` — its response carries the available-model list.
+pub const RPC_GET_USER_STATUS: &str = "otAQ7b";
+
 /// Bootstrap page — embeds `SNlM0e`/`cfb2h`/`FdrFJe` session tokens.
 pub const APP_URL: &str = "https://gemini.google.com/app";
 
@@ -100,6 +107,28 @@ pub fn models() -> Vec<String> {
     ].iter().map(|s| s.to_string()).collect()
 }
 
+/// The canonical Gemini web model table: `(request_name, model_id_hex, tier)`.
+///
+/// `tier`: 0=free, 1=standard, 2=advanced, 4=plus. The hex ids match those
+/// returned by the `otAQ7b` GetUserStatus RPC, so discovery can reverse-map a
+/// discovered hex id back to a request-usable name. Reverse-engineered from
+/// `gravity/gemini/constants.py::GEMINI_WEB_MODEL_HEADERS` + HanaokaYuzu/Gemini-API.
+pub const MODEL_TABLE: &[(&str, &str, u8)] = &[
+    ("gemini-3-flash", "fbb127bbb056c959", 1),
+    ("gemini-3-pro", "9d8ca3786ebdfbea", 1),
+    ("gemini-3-flash-thinking", "5bf011840784117a", 1),
+    ("gemini-3-pro-plus", "e6fa609c3fa255c0", 4),
+    ("gemini-3-flash-plus", "56fdd199312815e2", 4),
+    ("gemini-3-flash-thinking-plus", "e051ce1aa80aa576", 4),
+    ("gemini-3-pro-advanced", "e6fa609c3fa255c0", 2),
+    ("gemini-3-flash-advanced", "56fdd199312815e2", 2),
+];
+
+/// Reverse-map a hex `model_id` (from the `otAQ7b` RPC) to a request-usable name.
+pub fn model_name_for_id(id: &str) -> Option<&'static str> {
+    MODEL_TABLE.iter().find(|(_, hex, _)| *hex == id).map(|(name, _, _)| *name)
+}
+
 /// Model-specific headers — `x-goog-ext-525001261-jspb` carries the model ID.
 ///
 /// Values reverse-engineered from `gravity/gemini/constants.py::GEMINI_WEB_MODEL_HEADERS`.
@@ -109,17 +138,10 @@ pub fn models() -> Vec<String> {
 /// Format (from HAR): `[1,null,null,null,"<id>",null,null,0,[4,5,6,8],null,null,<tier>,null,null,1,1,"<uuid>"]`
 pub fn model_headers_with_uuid(model: &str, uuid: &str) -> Vec<(String, String)> {
     // (model_id, tier): tier 0=free, 1=standard, 2=advanced, 4=plus
-    let id_tier: Option<(&str, u8)> = match model {
-        "gemini-3-flash"               => Some(("fbb127bbb056c959", 1)),
-        "gemini-3-pro"                 => Some(("9d8ca3786ebdfbea", 1)),
-        "gemini-3-flash-thinking"      => Some(("5bf011840784117a", 1)),
-        "gemini-3-pro-plus"            => Some(("e6fa609c3fa255c0", 4)),
-        "gemini-3-flash-plus"          => Some(("56fdd199312815e2", 4)),
-        "gemini-3-flash-thinking-plus" => Some(("e051ce1aa80aa576", 4)),
-        "gemini-3-pro-advanced"        => Some(("e6fa609c3fa255c0", 2)),
-        "gemini-3-flash-advanced"      => Some(("56fdd199312815e2", 2)),
-        _ => None,
-    };
+    let id_tier: Option<(&str, u8)> = MODEL_TABLE
+        .iter()
+        .find(|(name, _, _)| *name == model)
+        .map(|(_, id, tier)| (*id, *tier));
     let mut headers: Vec<(String, String)> = vec![
         ("x-goog-ext-73010989-jspb".into(), "[0]".into()),
         ("x-goog-ext-73010990-jspb".into(), "[0,0,0]".into()),

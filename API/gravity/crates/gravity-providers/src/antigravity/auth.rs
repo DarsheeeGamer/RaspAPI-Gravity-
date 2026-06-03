@@ -8,10 +8,16 @@ use async_trait::async_trait;
 use gravity_core::{Error, ProviderAccount, ProviderErrorKind, ProviderName, Result};
 use gravity_http::{HttpClient, HttpRequest, Profile};
 
-// Set via GRAVITY_ANTIGRAVITY_CLIENT_ID / GRAVITY_ANTIGRAVITY_CLIENT_SECRET env vars at build time,
-// or supply credentials per-account in auth.extra["client_id"] / auth.extra["client_secret"].
-const CLIENT_ID: &str = "REDACTED";
-const CLIENT_SECRET: &str = "REDACTED";
+// Supply at build time via GRAVITY_ANTIGRAVITY_CLIENT_ID / _SECRET env vars.
+// Redacted in source (real values were leaked secrets).
+const CLIENT_ID: &str = match option_env!("GRAVITY_ANTIGRAVITY_CLIENT_ID") {
+    Some(v) => v,
+    None => "REDACTED",
+};
+const CLIENT_SECRET: &str = match option_env!("GRAVITY_ANTIGRAVITY_CLIENT_SECRET") {
+    Some(v) => v,
+    None => "REDACTED",
+};
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 /// Authenticator for the AntiGravity provider.
