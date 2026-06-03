@@ -1,5 +1,24 @@
+"""GravityAPI Gateway — OpenAI-compatible multi-provider LLM gateway.
+
+Endpoints:
+  GET  /                          service status + directory
+  GET  /v1/models                 list all available models
+  GET  /v1/models/{provider}      list models for one provider
+  POST /v1/chat/completions       OpenAI-compatible chat (streaming + tools)
+  POST /v1/embeddings             windsurf/cursor native embeddings
+  POST /api/generate-key          create a new API key
+  POST /api/add                   register a provider account
+  DELETE /api/accounts/{id}       remove an account
+  GET  /api/accounts              list your linked accounts
+  GET  /api/providers             list all supported providers + capabilities
+  GET  /api/metrics               request analytics
+  GET  /docs                      interactive documentation
+  POST /admin/generate-key        generate key with custom tier (admin only)
+  POST /admin/revoke-key          revoke a key (admin only)
+"""
+
 import fastapi as meow
-from fastapi import Header, HTTPException, Depends, Request
+from fastapi import HTTPException, Depends, Request, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,18 +27,26 @@ from typing import List, Dict, Any, Optional
 import json
 import time
 import secrets
-from genapi import generate_api_key, validate_api_key
-from llm import generate_response, generate_stream
-from account import add_account_to_db, record_request, get_metrics, get_db, load_accounts_for_key
+
+from genapi import generate_api_key, validate_api_key, is_admin, revoke_api_key
+from llm import generate_response, generate_stream, resolve_model, full_model_name
+from account import (
+    add_account_to_db, remove_account_from_db, list_accounts_for_key,
+    record_request, get_metrics, get_db,
+    get_providers_for_key,
+)
+from providers import PROVIDERS, FREE_PROVIDERS
+
+# ── App setup ─────────────────────────────────────────────────────────────────
 
 app = meow.FastAPI(
-    title="RASPAPI - GravityV2 Gateway",
-    description="Unified API gateway powered by GravityV2 for Cursor, Windsurf, ChatGPT, and Gemini.",
-    version="1.0.0",
-    docs_url=None
+    title="GravityAPI Gateway",
+    description="Unified multi-provider LLM gateway powered by GravityV2.",
+    version="2.0.0",
+    docs_url=None,
+    redoc_url=None,
 )
 
-# Enable CORS for maximum flexibility
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,818 +57,530 @@ app.add_middleware(
 
 security = HTTPBearer(auto_error=False)
 
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verifies the bearer API token using the LevelDB store."""
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     if not credentials:
-        raise HTTPException(status_code=401, detail="Missing API Key. Provide it in 'Authorization: Bearer grav_...' header.")
+        raise HTTPException(401, "Missing API key. Set Authorization: Bearer grav_...")
     token = credentials.credentials
     if not validate_api_key(token):
-        raise HTTPException(status_code=401, detail="Invalid, inactive, or revoked API Key.")
+        raise HTTPException(401, "Invalid or revoked API key.")
     return token
 
-class ChatCompletionRequest(BaseModel):
+
+async def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    if not credentials:
+        raise HTTPException(401, "Missing API key.")
+    token = credentials.credentials
+    if not is_admin(token):
+        raise HTTPException(403, "Admin access required.")
+    return token
+
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+
+def check_rate_limit(ip: str, api_key: str, provider: str):
+    has_custom = provider in get_providers_for_key(api_key)
+    if api_key == "grav_demoapikey":
+        limit = 5
+    elif has_custom:
+        limit = 2000
+    else:
+        limit = 20
+
+    hour = int(time.time() / 3600)
+    db = get_db()
+    rl_key = f"ratelimit:{api_key}:{ip}:{hour}".encode()
+    count_b = db.get(rl_key)
+    count = int(count_b.decode()) if count_b else 0
+    if count >= limit:
+        raise HTTPException(429, f"Hourly rate limit of {limit} req/hr exceeded.")
+    db.put(rl_key, str(count + 1).encode())
+
+    # Require custom account for non-free providers
+    if not has_custom and provider not in FREE_PROVIDERS:
+        raise HTTPException(
+            400,
+            f"Provider '{provider}' requires a registered account. "
+            "Add one via POST /api/add . See GET /api/providers for all providers.",
+        )
+
+
+# ── Message/tool conversion ───────────────────────────────────────────────────
+
+def _parse_messages(raw: List[Dict[str, Any]]):
+    from gravity.types import Message, ToolCall, ToolResult
+
+    messages = []
+    system_prompt = None
+
+    for m in raw:
+        role = m.get("role", "user")
+        content = m.get("content") or ""
+
+        if role == "system":
+            if not system_prompt:
+                system_prompt = content
+            messages.append(Message.system(content))
+
+        elif role == "user":
+            if isinstance(content, list):
+                content = "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
+            messages.append(Message.user(content))
+
+        elif role == "assistant":
+            tcs_raw = m.get("tool_calls") or []
+            tool_calls = []
+            for tc in tcs_raw:
+                func = tc.get("function", {})
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except Exception:
+                    args = {}
+                tool_calls.append(ToolCall(
+                    id=tc.get("id") or f"call_{secrets.token_hex(4)}",
+                    name=func.get("name", ""),
+                    arguments=args,
+                ))
+            messages.append(Message(role="assistant", content=content or "", tool_calls=tool_calls))
+
+        elif role == "tool":
+            try:
+                content_val = json.loads(content) if isinstance(content, str) else content
+            except Exception:
+                content_val = content
+            messages.append(Message.tool_result_message(ToolResult(
+                tool_call_id=m.get("tool_call_id", ""),
+                name=m.get("name", "tool"),
+                content=content_val,
+            )))
+
+    return messages, system_prompt
+
+
+def _parse_tools(raw: Optional[List[Dict[str, Any]]]):
+    if not raw:
+        return None
+    from gravity.tools import Tool, ToolDefinition
+    tools = []
+    for t in raw:
+        if t.get("type") == "function":
+            func = t.get("function", {})
+            tools.append(Tool(definition=ToolDefinition(
+                name=func.get("name", ""),
+                description=func.get("description", ""),
+                input_schema=func.get("parameters", {"type": "object", "properties": {}}),
+            )))
+    return tools or None
+
+
+def _format_tool_calls(tool_calls) -> List[Dict]:
+    if not tool_calls:
+        return []
+    return [{
+        "id": str(tc.id),
+        "type": "function",
+        "function": {"name": str(tc.name), "arguments": json.dumps(tc.arguments)},
+    } for tc in tool_calls]
+
+
+# ── Schemas ───────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
     model: str
     messages: List[Dict[str, Any]]
     stream: Optional[bool] = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    seed: Optional[int] = None
     system_prompt: Optional[str] = None
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Any] = None
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+
+
+class AddAccountRequest(BaseModel):
+    account_id: str
+    provider: str
+    # Auth fields — supply what your provider needs
+    api_key: Optional[str] = None
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    session_key: Optional[str] = None
+    cookies: Optional[Dict[str, str]] = None
+    # Provider-specific
+    org_id: Optional[str] = None
+    device_id: Optional[str] = None
+    routing_hint: Optional[str] = None
+    project: Optional[str] = None
+    region: Optional[str] = None
+    profile_arn: Optional[str] = None
+    email: Optional[str] = None
+    expires_at: Optional[int] = None
+    chatgpt_account_id: Optional[str] = None
+    user_id: Optional[str] = None
+    at: Optional[str] = None
+    bl: Optional[str] = None
+    f_sid: Optional[str] = None
+    # Transport
+    base_url: Optional[str] = None
+    pool: Optional[str] = "custom"
+    priority: Optional[int] = 100
+    weight: Optional[int] = 1
+    timeout_ms: Optional[int] = 120000
+    impersonate: Optional[str] = None
+    proxy_url: Optional[str] = None
+    extra_headers: Optional[Dict[str, str]] = None
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def index():
+    return {
+        "service": "GravityAPI Gateway",
+        "version": "2.0.0",
+        "providers": len(PROVIDERS),
+        "free_providers": sorted(FREE_PROVIDERS),
+        "endpoints": {
+            "GET  /v1/models":                 "List all available models",
+            "GET  /v1/models/{provider}":      "List models for a specific provider",
+            "POST /v1/chat/completions":        "OpenAI-compatible chat completions",
+            "POST /v1/embeddings":             "Embeddings (windsurf/cursor)",
+            "POST /api/generate-key":          "Generate a new API key",
+            "POST /api/add":                   "Register a provider account",
+            "DELETE /api/accounts/{id}":       "Remove an account",
+            "GET  /api/accounts":              "List your registered accounts",
+            "GET  /api/providers":             "All supported providers + auth guide",
+            "GET  /api/metrics":               "Request analytics",
+            "GET  /docs":                      "Interactive documentation",
+        },
+    }
+
+
+@app.get("/v1/models")
+def list_models(token: str = Depends(verify_token)):
+    now = int(time.time())
+    models = []
+    for pname, meta in PROVIDERS.items():
+        for m in meta["models"]:
+            models.append({
+                "id": f"{pname}/{m}",
+                "object": "model",
+                "created": now,
+                "owned_by": pname,
+                "provider": pname,
+                "category": meta["category"],
+                "tool_support": meta["tool_support"],
+                "requires_account": meta["requires_custom_account"],
+            })
+    return {"object": "list", "data": models}
+
+
+@app.get("/v1/models/{provider}")
+def list_provider_models(provider: str, token: str = Depends(verify_token)):
+    provider = provider.lower()
+    if provider not in PROVIDERS:
+        raise HTTPException(404, f"Unknown provider: {provider!r}")
+    meta = PROVIDERS[provider]
+    now = int(time.time())
+    return {
+        "object": "list",
+        "provider": provider,
+        "display_name": meta["display_name"],
+        "tool_support": meta["tool_support"],
+        "requires_account": meta["requires_custom_account"],
+        "data": [
+            {"id": f"{provider}/{m}", "object": "model", "created": now, "owned_by": provider}
+            for m in meta["models"]
+        ],
+    }
+
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, request: Request, token: str = Depends(verify_token)):
-    """
-    OpenAI-compatible chat completions endpoint.
-    Routes requests dynamically to either Custom Pool or Default Pool with IP-based hourly rate limits.
-    Supports complete message histories and function tools schemas.
-    """
-    model_name = req.model
-    record_request(model_name)
-    
-    # 1. Parse provider from model name
-    from llm import resolve_model_name
-    resolved_model = resolve_model_name(model_name)
-    provider = resolved_model.split("/")[0]
+async def chat_completions(req: ChatRequest, request: Request, token: str = Depends(verify_token)):
+    """OpenAI-compatible chat completions — all 40+ providers, streaming, tools, MFC."""
+    provider, model_name = resolve_model(req.model)
+    full = full_model_name(provider, model_name)
+    check_rate_limit(request.client.host, token, provider)
+    record_request(full, token)
 
-    # 2. Resolve pool: custom if the user has their own active credential for this provider, else default
-    custom_accounts = load_accounts_for_key(token)
-    has_custom = False
-    if custom_accounts and custom_accounts.emails:
-        for email_bundle in custom_accounts.emails:
-            for acc in email_bundle.providers:
-                if acc.provider.value == provider and acc.enabled:
-                    has_custom = True
-                    break
-            if has_custom:
-                break
-
-    pool = "custom" if has_custom else "default"
-
-    # 3. IP-Based Hourly Rate Limiting
-    ip = request.client.host
-    current_hour = int(time.time() / 3600)
-    db_conn = get_db()
-    
-    ratelimit_key = f"ratelimit:ip:{ip}:hour:{current_hour}".encode("utf-8")
-    current_count_bytes = db_conn.get(ratelimit_key)
-    current_count = int(current_count_bytes.decode("utf-8")) if current_count_bytes else 0
-    
-    limit = 2000 if pool == "custom" else 20
-    if current_count >= limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"IP-based hourly rate limit exceeded for IP {ip} in the default pool ({limit} req/hr)." if pool == "default"
-            else f"IP-based hourly rate limit exceeded for IP {ip} in the custom pool ({limit} req/hr)."
-        )
-        
-    db_conn.put(ratelimit_key, str(current_count + 1).encode("utf-8"))
-
-    # 4. Enforce Lifetime Default Allowances for Default Pool
-    if pool == "default":
-        # Enforce that only windsurf and cursor can fallback to default pool
-        if provider not in ["windsurf", "cursor"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Provider '{provider}' is not supported in the default pool. Register your own account via /api/add."
-            )
-            
-        # Enforce default models
-        if provider == "windsurf" and resolved_model != "windsurf/swe-1-6-slow":
-            raise HTTPException(
-                status_code=400,
-                detail="Only model 'windsurf/swe-1-6-slow' is available in the default pool."
-            )
-        if provider == "cursor" and resolved_model != "cursor/auto":
-            raise HTTPException(
-                status_code=400,
-                detail="Only model 'cursor/auto' is available in the default pool."
-            )
-            
-        # Lifetime default allowance (20 requests per provider per API key, tracked by IP for grav_demoapikey)
-        if token == "grav_demoapikey":
-            allowance_key = f"allowance:default:demo:{ip}:{provider}".encode("utf-8")
-        else:
-            allowance_key = f"allowance:default:{token}:{provider}".encode("utf-8")
-            
-        used_bytes = db_conn.get(allowance_key)
-        used_count = int(used_bytes.decode("utf-8")) if used_bytes else 0
-        
-        if used_count >= 20:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Lifetime default allowance of 20 requests exceeded for provider '{provider}'. Please link your own provider account to continue."
-            )
-            
-        db_conn.put(allowance_key, str(used_count + 1).encode("utf-8"))
-
-    # 5. Map OpenAI History to Gravity Messages
-    from gravity.types import Message, ToolCall, ToolResult
-    from gravity.tools import Tool, ToolDefinition
-
-    gravity_messages = []
-    system_prompt = req.system_prompt
-
-    for m in req.messages:
-        role = m.get("role")
-        content = m.get("content")
-        
-        if role == "system":
-            # Set system prompt if not already set, otherwise append as message
-            if not system_prompt:
-                system_prompt = content
-            gravity_messages.append(Message.system(content))
-            
-        elif role == "user":
-            gravity_messages.append(Message.user(content))
-            
-        elif role == "assistant":
-            tool_calls_data = m.get("tool_calls")
-            tool_calls = []
-            if tool_calls_data:
-                for tc in tool_calls_data:
-                    func = tc.get("function", {})
-                    args_str = func.get("arguments", "{}")
-                    try:
-                        args = json.loads(args_str)
-                    except Exception:
-                        args = {}
-                    tool_calls.append(
-                        ToolCall(
-                            id=tc.get("id") or f"call_{secrets.token_hex(4)}",
-                            name=func.get("name"),
-                            arguments=args
-                        )
-                    )
-            gravity_messages.append(
-                Message(
-                    role="assistant",
-                    content=content or "",
-                    tool_calls=tool_calls
-                )
-            )
-            
-        elif role == "tool":
-            tool_call_id = m.get("tool_call_id")
-            tool_content = m.get("content", "")
-            try:
-                content_val = json.loads(tool_content)
-            except Exception:
-                content_val = tool_content
-                
-            tool_name = m.get("name", "tool")
-            
-            result_obj = ToolResult(
-                tool_call_id=tool_call_id,
-                name=tool_name,
-                content=content_val
-            )
-            gravity_messages.append(Message.tool_result_message(result_obj))
-
-    # 6. Map OpenAI Tools to Gravity Tools
-    gravity_tools = None
-    if req.tools:
-        gravity_tools = []
-        for t in req.tools:
-            if t.get("type") == "function":
-                func = t.get("function", {})
-                name = func.get("name")
-                desc = func.get("description")
-                params = func.get("parameters", {"type": "object", "properties": {}})
-                gravity_tools.append(
-                    Tool(
-                        definition=ToolDefinition(
-                            name=name,
-                            description=desc,
-                            input_schema=params
-                        )
-                    )
-                )
+    messages, sys_prompt = _parse_messages(req.messages)
+    system_prompt = req.system_prompt or sys_prompt
+    tools = _parse_tools(req.tools)
 
     if req.stream:
-        async def stream_generator():
+        async def _stream():
             chat_id = f"chatcmpl-{secrets.token_hex(12)}"
-            created_time = int(time.time())
+            created = int(time.time())
             try:
-                async for token_text in generate_stream(
-                    token, 
-                    model_name, 
-                    gravity_messages, 
-                    system_prompt, 
-                    tools=gravity_tools, 
-                    pool=pool
+                async for chunk in generate_stream(
+                    token, req.model, messages, system_prompt,
+                    tools=tools, temperature=req.temperature, max_tokens=req.max_tokens,
                 ):
-                    chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": token_text},
-                                "finish_reason": None
-                            }
-                        ]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    
-                # Signal stop
-                finish_chunk = {
-                    "id": chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }
-                    ]
-                }
-                yield f"data: {json.dumps(finish_chunk)}\n\n"
+                    yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': chunk}, 'finish_reason': None}]})}\n\n"
+                yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
-                error_chunk = {
-                    "id": chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": f"\n[Gravity Gate Error: {str(e)}]"},
-                            "finish_reason": "error"
-                        }
-                    ]
-                }
-                yield f"data: {json.dumps(error_chunk)}\n\n"
+                yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': f'[Error: {e}]'}, 'finish_reason': 'error'}]})}\n\n"
                 yield "data: [DONE]\n\n"
+        return StreamingResponse(_stream(), media_type="text/event-stream")
 
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-    
+    try:
+        resp = await generate_response(
+            token, req.model, messages, system_prompt,
+            tools=tools, temperature=req.temperature,
+            max_tokens=req.max_tokens, seed=req.seed,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Generation failed: {e}")
+
+    # Extract content
+    if isinstance(resp.message.content, str):
+        content_text = resp.message.content
+    elif hasattr(resp.message.content, "text"):
+        content_text = resp.message.content.text
     else:
-        try:
-            resp = await generate_response(
-                token, 
-                model_name, 
-                gravity_messages, 
-                system_prompt, 
-                tools=gravity_tools, 
-                pool=pool
-            )
-            content_text = resp.message.content if isinstance(resp.message.content, str) else str(resp.message.content)
-            
-            # Format tool calls back to OpenAI schema
-            openai_tool_calls = []
-            if resp.message.tool_calls:
-                for tc in resp.message.tool_calls:
-                    openai_tool_calls.append({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    })
-                    
-            return {
-                "id": f"chatcmpl-{secrets.token_hex(12)}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": content_text or None,
-                            "tool_calls": openai_tool_calls if openai_tool_calls else None
-                        },
-                        "finish_reason": "tool_calls" if openai_tool_calls else (resp.finish_reason or "stop")
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": resp.usage.input_tokens or 0,
-                    "completion_tokens": resp.usage.output_tokens or 0,
-                    "total_tokens": resp.usage.total_tokens or resp.usage.total
-                }
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Gravity execution failed: {str(e)}")
+        content_text = str(resp.message.content or "")
+
+    oai_tcs = _format_tool_calls(resp.message.tool_calls)
+    finish = "tool_calls" if oai_tcs else (resp.finish_reason or "stop")
+
+    return {
+        "id": f"chatcmpl-{secrets.token_hex(12)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content_text or None,
+                "tool_calls": oai_tcs if oai_tcs else None,
+            },
+            "finish_reason": finish,
+        }],
+        "usage": {
+            "prompt_tokens": resp.usage.input_tokens or 0,
+            "completion_tokens": resp.usage.output_tokens or 0,
+            "total_tokens": resp.usage.total_tokens or (
+                (resp.usage.input_tokens or 0) + (resp.usage.output_tokens or 0)
+            ),
+        },
+    }
+
+
+@app.post("/v1/embeddings")
+async def embeddings(payload: Dict[str, Any], token: str = Depends(verify_token)):
+    """Native embeddings via windsurf or cursor (1024-dim float32)."""
+    model = payload.get("model", "windsurf/swe-1-6-fast")
+    input_data = payload.get("input", [])
+    if isinstance(input_data, str):
+        input_data = [input_data]
+
+    provider, _ = resolve_model(model)
+    check_rate_limit("127.0.0.1", token, provider)
+    record_request(model, token)
+
+    try:
+        from gravity import AsyncGravityClient
+        from llm import _build_accounts_file
+        accounts = _build_accounts_file(token, provider)
+        client = AsyncGravityClient(accounts=accounts)
+        result = await client.embeddings(model=model, texts=input_data)
+        return {
+            "object": "list",
+            "model": model,
+            "data": [
+                {"object": "embedding", "index": i, "embedding": emb}
+                for i, emb in enumerate(result.embeddings)
+            ],
+            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Embeddings failed: {e}")
+
+
+# ── Account management ────────────────────────────────────────────────────────
 
 @app.post("/api/generate-key")
-def generate_key_api() -> dict:
-    """JSON API to generate and store a new active API key."""
-    apikey = generate_api_key()
-    return {"apikey": f"grav_{apikey}", "status": "active", "pool": "default"}
-@app.get("/")
-def index() -> dict:
+def generate_key_endpoint():
+    key = generate_api_key()
     return {
-        "message": "Welcome to GravityAPI Gateway!",
-        "documentation_url": "/docs",
-        "endpoints": {
-            "GET /": "Service status and endpoint directory",
-            "GET /docs": "Interactive documentation viewer & Python integration templates",
-            "GET /api/metrics": "Telemetry health metrics and request volume analytics",
-            "POST /v1/chat/completions": "OpenAI-compatible chat completions proxy",
-            "POST /api/generate-key": "Generate and persist a new active Bearer token",
-            "POST /api/add": "Link custom Cursor/Windsurf provider credentials to elevate limits"
-        }
+        "api_key": key,
+        "tier": "default",
+        "limits": {"shared_pool": "20 req/hr", "custom_pool": "2000 req/hr"},
+        "free_providers": sorted(FREE_PROVIDERS),
+        "next_steps": "POST /api/add to register provider accounts, GET /api/providers for details.",
     }
-    
+
+
 @app.post("/api/add")
-def add_account(payload: Dict[str, Any], token: str = Depends(verify_token)):
+def add_account(req: AddAccountRequest, token: str = Depends(verify_token)):
+    """Register any of the 40+ providers. See GET /api/providers for auth requirements."""
+    payload = req.model_dump(exclude_none=True)
     try:
-        result = add_account_to_db(token, payload)
-        return result
+        return add_account_to_db(token, payload)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(500, f"Account registration failed: {e}")
+
+
+@app.delete("/api/accounts/{account_id}")
+def delete_account(
+    account_id: str,
+    provider: str = Query(..., description="Provider name, e.g. groq"),
+    token: str = Depends(verify_token),
+):
+    result = remove_account_from_db(token, account_id, provider)
+    if result["status"] == "not_found":
+        raise HTTPException(404, "Account not found.")
+    return result
+
+
+@app.get("/api/accounts")
+def get_accounts(token: str = Depends(verify_token)):
+    return {
+        "accounts": list_accounts_for_key(token),
+        "registered_providers": sorted(get_providers_for_key(token)),
+    }
+
+
+@app.get("/api/providers")
+def get_providers():
+    """Full provider catalog with auth requirements."""
+    result = []
+    for name, meta in PROVIDERS.items():
+        result.append({
+            "id": name,
+            "display_name": meta["display_name"],
+            "category": meta["category"],
+            "description": meta["description"],
+            "auth_kinds": meta["auth_kinds"],
+            "tool_support": meta["tool_support"],
+            "structured_output": meta["structured_output"],
+            "supports_system_prompt": meta["supports_system_prompt"],
+            "requires_account": meta["requires_custom_account"],
+            "free": not meta["requires_custom_account"],
+            "default_base_url": meta["default_base_url"] or None,
+            "models": meta["models"],
+        })
+    return {
+        "total": len(result),
+        "free_providers": sorted(FREE_PROVIDERS),
+        "providers": result,
+    }
+
 
 @app.get("/api/metrics")
-def metrics():
+def metrics(token: str = Depends(verify_token)):
     return get_metrics()
 
+
+# ── Admin ─────────────────────────────────────────────────────────────────────
+
+@app.post("/admin/generate-key")
+def admin_generate_key(payload: Dict[str, Any], token: str = Depends(verify_admin)):
+    tier = payload.get("tier", "default")
+    label = payload.get("label", "")
+    key = generate_api_key(label=label, tier=tier)
+    return {"api_key": key, "tier": tier, "label": label}
+
+
+@app.post("/admin/revoke-key")
+def admin_revoke_key(payload: Dict[str, Any], token: str = Depends(verify_admin)):
+    key = payload.get("api_key", "")
+    if not key:
+        raise HTTPException(400, "Missing api_key")
+    return {"status": "revoked" if revoke_api_key(key) else "not_found"}
+
+
+# ── Docs ──────────────────────────────────────────────────────────────────────
+
 @app.get("/docs", response_class=HTMLResponse)
-def documentation_ui():
+def documentation():
     try:
-        with open("./docs/api_guide.md", "r", encoding="utf-8") as f:
-            md_content = f.read()
+        with open("./docs/api_guide.md", encoding="utf-8") as f:
+            md = f.read()
     except Exception:
-        md_content = "# Gravity AI API documentation\n*(api_guide.md not found)*"
+        md = ""
 
-    html_content = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gravity API Gateway Explorer</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
-    <style>
-        :root {
-            --bg-color: #080911;
-            --panel-bg: rgba(17, 19, 36, 0.75);
-            --border-color: rgba(255, 255, 255, 0.08);
-            --accent-purple: #8b5cf6;
-            --accent-cyan: #06b6d4;
-            --accent-gradient: linear-gradient(135deg, #8b5cf6, #06b6d4);
-            --text-primary: #f3f4f6;
-            --text-secondary: #9ca3af;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
-        body {
-            font-family: 'Outfit', sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-primary);
-            min-height: 100vh;
-            background-image: 
-                radial-gradient(at 0% 0%, rgba(139, 92, 246, 0.12) 0px, transparent 50%),
-                radial-gradient(at 100% 100%, rgba(6, 182, 212, 0.12) 0px, transparent 50%);
-            overflow-x: hidden;
-            display: flex;
-            flex-direction: column;
-        }
-
-        header {
-            padding: 1.5rem 2rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid var(--border-color);
-            backdrop-filter: blur(12px);
-            position: sticky;
-            top: 0;
-            z-index: 100;
-            background: rgba(8, 9, 17, 0.8);
-        }
-
-        .logo-section h1 {
-            font-weight: 700;
-            font-size: 1.8rem;
-            background: var(--accent-gradient);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-        }
-
-        .logo-section p {
-            color: var(--text-secondary);
-            font-size: 0.85rem;
-            margin-top: 0.2rem;
-        }
-
-        .container {
-            max-width: 1600px;
-            width: 100%;
-            margin: 0 auto;
-            padding: 2rem;
-            display: grid;
-            grid-template-columns: 1fr 500px;
-            gap: 2rem;
-            flex: 1;
-        }
-
-        @media (max-width: 1200px) {
-            .container {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        .panel {
-            background: var(--panel-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 2.5rem;
-            backdrop-filter: blur(16px);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-            overflow-y: auto;
-        }
-
-        #doc-content h1, #doc-content h2, #doc-content h3 {
-            font-weight: 700;
-            margin-top: 2rem;
-            margin-bottom: 1rem;
-            color: #fff;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            padding-bottom: 0.5rem;
-        }
-        
-        #doc-content h1 { font-size: 2rem; }
-        #doc-content h2 { font-size: 1.5rem; }
-        #doc-content h3 { font-size: 1.2rem; }
-
-        #doc-content p {
-            line-height: 1.7;
-            color: #d1d5db;
-            margin-bottom: 1.25rem;
-            font-size: 0.95rem;
-        }
-
-        #doc-content ul, #doc-content ol {
-            margin-bottom: 1.5rem;
-            padding-left: 1.5rem;
-            color: #d1d5db;
-            font-size: 0.95rem;
-        }
-
-        #doc-content li {
-            margin-bottom: 0.5rem;
-            line-height: 1.6;
-        }
-
-        #doc-content table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 1.5rem 0;
-            font-size: 0.9rem;
-        }
-
-        #doc-content th, #doc-content td {
-            padding: 0.75rem 1rem;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-            text-align: left;
-        }
-
-        #doc-content th {
-            color: var(--text-secondary);
-            font-weight: 600;
-            background: rgba(255, 255, 255, 0.02);
-        }
-
-        #doc-content td code {
-            font-family: 'JetBrains Mono', monospace;
-            background: rgba(255, 255, 255, 0.06);
-            padding: 0.2rem 0.4rem;
-            border-radius: 4px;
-            color: #67e8f9;
-        }
-
-        #doc-content pre {
-            background: #05060b !important;
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            padding: 1.25rem;
-            margin: 1.5rem 0;
-            overflow-x: auto;
-        }
-
-        .right-panel {
-            display: flex;
-            flex-direction: column;
-            gap: 1.5rem;
-            position: sticky;
-            top: 6.5rem;
-            height: calc(100vh - 9rem);
-        }
-
-        .examples-title {
-            font-size: 1.2rem;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-            padding-bottom: 0.75rem;
-            margin-bottom: 1rem;
-        }
-
-        .tab-buttons {
-            display: flex;
-            gap: 0.5rem;
-            background: rgba(255, 255, 255, 0.02);
-            padding: 0.4rem;
-            border-radius: 10px;
-            border: 1px solid var(--border-color);
-        }
-
-        .tab-btn {
-            flex: 1;
-            padding: 0.6rem;
-            border-radius: 6px;
-            background: transparent;
-            color: var(--text-secondary);
-            border: none;
-            cursor: pointer;
-            font-weight: 500;
-            font-size: 0.85rem;
-            transition: all 0.2s ease;
-        }
-
-        .tab-btn.active {
-            background: var(--accent-purple);
-            color: #fff;
-            box-shadow: 0 4px 10px rgba(139, 92, 246, 0.35);
-        }
-
-        .code-container {
-            flex: 1;
-            position: relative;
-            background: #05060b;
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .code-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 0.75rem 1rem;
-            background: rgba(255, 255, 255, 0.03);
-            border-bottom: 1px solid var(--border-color);
-            font-size: 0.8rem;
-            color: var(--text-secondary);
-        }
-
-        .code-body {
-            flex: 1;
-            overflow: auto;
-            margin: 0;
-            padding: 1rem;
-        }
-
-        .code-body pre {
-            margin: 0 !important;
-            background: transparent !important;
-            padding: 0 !important;
-        }
-
-        .copy-btn {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            color: var(--text-primary);
-            padding: 0.3rem 0.7rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-
-        .copy-btn:hover {
-            background: rgba(255, 255, 255, 0.1);
-            border-color: rgba(255, 255, 255, 0.2);
-        }
-    </style>
-</head>
-<body>
-    <header>
-        <div class="logo-section">
-            <h1>🌌 Gravity Gateway</h1>
-            <p>API Integration Center</p>
-        </div>
-        <div>
-            <button class="copy-btn" onclick="location.href='/api/metrics'">📊 Telemetry Metrics</button>
-        </div>
-    </header>
-
-    <div class="container">
-        <div class="panel">
-            <div id="doc-content"></div>
-        </div>
-
-        <div class="panel right-panel">
-            <div class="examples-title">🐍 Python Examples</div>
-            <div class="tab-buttons">
-                <button class="tab-btn active" onclick="switchExample('completions')">Completions</button>
-                <button class="tab-btn" onclick="switchExample('tools')">Tool Calling</button>
-                <button class="tab-btn" onclick="switchExample('register')">Register Account</button>
-            </div>
-
-            <div class="code-container">
-                <div class="code-header">
-                    <span id="example-filename">example_completions.py</span>
-                    <button class="copy-btn" onclick="copyExampleCode()">📋 Copy Code</button>
-                </div>
-                <div class="code-body">
-                    <pre><code id="example-code" class="language-python"># Select a tab above to load example code...</code></pre>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <textarea id="raw-markdown" style="display: none;">{{MD_CONTENT}}</textarea>
-
-    <script>
-        const examples = {
-            completions: `import urllib.request
-import json
-
-url = "https://kaededev.hackclub.app/v1/chat/completions"
-headers = {
-    "Authorization": "Bearer grav_your_api_key",
-    "Content-Type": "application/json"
-}
-payload = {
-    "model": "cursor/auto",
-    "messages": [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Write a small haiku abt coding."}
-    ]
-}
-
-req = urllib.request.Request(
-    url, 
-    data=json.dumps(payload).encode("utf-8"), 
-    headers=headers, 
-    method="POST"
-)
-
-with urllib.request.urlopen(req) as response:
-    result = json.loads(response.read().decode("utf-8"))
-    print("🤖 Response:\\n", result["choices"][0]["message"]["content"])`,
-
-            tools: `import urllib.request
-import json
-
-url = "https://kaededev.hackclub.app/v1/chat/completions"
-headers = {
-    "Authorization": "Bearer grav_your_api_key",
-    "Content-Type": "application/json"
-}
-
-# 1. Ask the model with dynamic tool definitions
-messages = [{"role": "user", "content": "Fetch the weather for New York."}]
-tools = [{
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Get current weather in location",
-        "parameters": {
-            "type": "object",
-            "properties": {"location": {"type": "string"}},
-            "required": ["location"]
-        }
-    }
-}]
-
-payload = {"model": "cursor/auto", "messages": messages, "tools": tools}
-req = urllib.request.Request(
-    url, 
-    data=json.dumps(payload).encode("utf-8"), 
-    headers=headers, 
-    method="POST"
-)
-
-with urllib.request.urlopen(req) as r:
-    res = json.loads(r.read().decode("utf-8"))
-
-choice = res["choices"][0]
-assistant_msg = choice["message"]
-
-# 2. Handle Manual Function Calling (MFC) on the client side
-if choice["finish_reason"] == "tool_calls":
-    tool_call = assistant_msg["tool_calls"][0]
-    tool_call_id = tool_call["id"]
-    tool_name = tool_call["function"]["name"]
-    arguments = json.loads(tool_call["function"]["arguments"])
-    
-    print(f"🏃 Executing tool '{tool_name}' for '{arguments['location']}'...")
-    # Simulate execution locally
-    tool_result = {"temperature": "72°F", "condition": "Partly Cloudy"}
-    
-    # Update conversation history
-    messages.append(assistant_msg)
-    messages.append({
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "name": tool_name,
-        "content": json.dumps(tool_result)
-    })
-    
-    # Send tool result back to gateway
-    payload = {"model": "cursor/auto", "messages": messages, "tools": tools}
-    req2 = urllib.request.Request(
-        url, 
-        data=json.dumps(payload).encode("utf-8"), 
-        headers=headers, 
-        method="POST"
+    provider_rows = "\n".join(
+        f"| `{n}` | {m['display_name']} | {m['category']} | "
+        f"{'✓ free' if not m['requires_custom_account'] else 'own key'} | "
+        f"{m['tool_support']} |"
+        for n, m in PROVIDERS.items()
     )
-    with urllib.request.urlopen(req2) as r2:
-        final_res = json.loads(r2.read().decode("utf-8"))
-        print("🤖 Final Response:\\n", final_res["choices"][0]["message"]["content"])`,
+    providers_section = f"""
+## Supported Providers ({len(PROVIDERS)} total, {len(FREE_PROVIDERS)} free)
 
-            register: `import urllib.request
-import json
+| ID | Name | Category | Access | Tools |
+|----|------|----------|--------|-------|
+{provider_rows}
 
-url = "https://kaededev.hackclub.app/api/add"
-headers = {
-    "Authorization": "Bearer grav_your_api_key",
-    "Content-Type": "application/json"
-}
+**Free providers** (no account needed): {', '.join(f'`{p}`' for p in sorted(FREE_PROVIDERS))}
 
-# Payload to link Cursor/Windsurf credentials and elevate limits (2000 req/hr)
-payload = {
-    "account_id": "personal_account_1",
-    "provider": "cursor",
-    "api_key": "your_raw_cursor_refresh_token_here",
-    "pool": "default",
-    "priority": 100,
-    "weight": 1,
-    "transport": {
-        "timeout_ms": 120000
-    }
-}
+### Adding an account
 
-req = urllib.request.Request(
-    url, 
-    data=json.dumps(payload).encode("utf-8"), 
-    headers=headers, 
-    method="POST"
-)
+```python
+import requests
+r = requests.post("https://your-server/api/add",
+    headers={{"Authorization": "Bearer grav_your_key"}},
+    json={{
+        "account_id": "my_groq",
+        "provider": "groq",
+        "api_key": "gsk_...",
+    }})
+```
 
-with urllib.request.urlopen(req) as response:
-    result = json.loads(response.read().decode("utf-8"))
-    print("📋 Registration Response:", result)`
-        };
+### Chat example
 
-        const mdText = document.getElementById('raw-markdown').value;
-        document.getElementById('doc-content').innerHTML = marked.parse(mdText);
+```python
+import requests
+r = requests.post("https://your-server/v1/chat/completions",
+    headers={{"Authorization": "Bearer grav_your_key"}},
+    json={{
+        "model": "groq/llama-3.3-70b-versatile",
+        "messages": [{{"role": "user", "content": "Hello!"}}],
+    }})
+print(r.json()["choices"][0]["message"]["content"])
+```
+"""
+    full_md = providers_section + "\n\n" + md
 
-        function switchExample(key) {
-            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-            
-            const btn = Array.from(document.querySelectorAll('.tab-btn')).find(b => b.getAttribute('onclick').includes(key));
-            if (btn) btn.classList.add('active');
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><title>GravityAPI v2 Docs</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+<style>:root{{--bg:#080911;--panel:rgba(17,19,36,.75);--border:rgba(255,255,255,.08);--purple:#8b5cf6;--cyan:#06b6d4;--text:#f3f4f6;--muted:#9ca3af}}
+*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;background-image:radial-gradient(at 0% 0%,rgba(139,92,246,.12) 0,transparent 50%),radial-gradient(at 100% 100%,rgba(6,182,212,.12) 0,transparent 50%)}}
+header{{padding:1.5rem 2rem;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);backdrop-filter:blur(12px);position:sticky;top:0;z-index:100;background:rgba(8,9,17,.8)}}
+.logo{{font-weight:700;font-size:1.8rem;background:linear-gradient(135deg,#8b5cf6,#06b6d4);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+.container{{max-width:1100px;margin:0 auto;padding:2rem}}.panel{{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:2.5rem;backdrop-filter:blur(16px)}}
+#doc h1,#doc h2,#doc h3{{font-weight:700;margin-top:2rem;margin-bottom:1rem;color:#fff;border-bottom:1px solid rgba(255,255,255,.05);padding-bottom:.5rem}}
+#doc h1{{font-size:2rem}}#doc h2{{font-size:1.5rem}}#doc h3{{font-size:1.2rem}}#doc p{{line-height:1.7;color:#d1d5db;margin-bottom:1.25rem;font-size:.95rem}}
+#doc ul,#doc ol{{margin-bottom:1.5rem;padding-left:1.5rem;color:#d1d5db;font-size:.95rem}}
+#doc table{{width:100%;border-collapse:collapse;margin:1.5rem 0;font-size:.83rem}}
+#doc th,#doc td{{padding:.55rem .75rem;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}}
+#doc th{{color:var(--muted);font-weight:600;background:rgba(255,255,255,.02)}}
+#doc code{{font-family:'JetBrains Mono',monospace;background:rgba(255,255,255,.06);padding:.2rem .4rem;border-radius:4px;color:#67e8f9;font-size:.85em}}
+#doc pre{{background:#05060b!important;border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin:1.5rem 0;overflow-x:auto}}
+#doc pre code{{background:transparent;padding:0;color:inherit}}</style></head><body>
+<header><div><div class="logo">🌌 GravityAPI</div><div style="color:var(--muted);font-size:.85rem">v2.0 · {len(PROVIDERS)} providers</div></div>
+<a href="/api/providers" style="color:var(--cyan);text-decoration:none;font-size:.85rem">providers JSON →</a></header>
+<div class="container"><div class="panel"><div id="doc"></div></div></div>
+<textarea id="md" style="display:none">{full_md.replace(chr(96), "&#96;")}</textarea>
+<script>
+document.getElementById("doc").innerHTML=marked.parse(document.getElementById("md").value.replace(/&#96;/g,"`"));
+document.querySelectorAll("#doc pre code").forEach(b=>Prism.highlightElement(b));
+</script></body></html>""")
 
-            const codeElem = document.getElementById('example-code');
-            codeElem.textContent = examples[key];
-            
-            document.getElementById('example-filename').textContent = `example_${key === 'completions' ? 'completions' : key === 'tools' ? 'tool_calling' : 'register_account'}.py`;
-            
-            Prism.highlightElement(codeElem);
-        }
-
-        function copyExampleCode() {
-            const text = document.getElementById('example-code').textContent;
-            navigator.clipboard.writeText(text);
-            alert("Example code copied to clipboard!");
-        }
-
-        switchExample('completions');
-        
-        document.querySelectorAll('#doc-content pre code').forEach(block => {
-            Prism.highlightElement(block);
-        });
-    </script>
-</body>
-</html>"""
-    return HTMLResponse(content=html_content.replace("{{MD_CONTENT}}", md_content))
 
 if __name__ == "__main__":
     import uvicorn

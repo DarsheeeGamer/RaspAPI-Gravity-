@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gravity-core",
+    "crates/gravity-http",
+    # added as each crate is created:
+    "crates/gravity-accounts",
+    "crates/gravity-providers",
+    "crates/gravity-client",
+    "crates/gravity-ffi",
+    "crates/gravity-server",
+    "crates/gravity-cli",
+    "crates/gravity-pyo3",
+    "crates/gravity-node",
+    "crates/gravity-testkit",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["DarsheeeGamer"]
+repository = "https://github.com/DarsheeeGamer/GravityV2"
+description = "Unified multi-provider AI gateway — pure-Rust port of Gravity"
+
+[workspace.dependencies]
+# Internal crates
+gravity-core = { path = "crates/gravity-core", version = "2.0.0" }
+gravity-http = { path = "crates/gravity-http", version = "2.0.0" }
+gravity-accounts = { path = "crates/gravity-accounts", version = "2.0.0" }
+gravity-providers = { path = "crates/gravity-providers", version = "2.0.0" }
+gravity-client = { path = "crates/gravity-client", version = "2.0.0" }
+gravity-testkit = { path = "crates/gravity-testkit", version = "2.0.0" }
+
+# Serialization
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Async
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# Memory-frugal primitives
+bytes = { version = "1", features = ["serde"] }
+smallvec = { version = "1", features = ["serde", "union"] }
+
+# Error handling
+thiserror = "2"
+
+# Utilities
+enum-map = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+tracing = "0.1"
+
+# Crypto (accounts + provider signing)
+sha2 = "0.10"
+sha3 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+cbc = { version = "0.1", features = ["std"] }
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.bench]
+lto = "thin"

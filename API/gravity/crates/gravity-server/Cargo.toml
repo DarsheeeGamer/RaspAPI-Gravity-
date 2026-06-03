@@ -1,0 +1,36 @@
+[package]
+name = "gravity-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "OpenAI-compatible HTTP server for the Gravity AI gateway (axum)."
+
+[lints.rust]
+missing_docs = "warn"
+
+[lib]
+name = "gravity_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gravity-server"
+path = "src/main.rs"
+
+[dependencies]
+gravity-core.workspace = true
+gravity-providers.workspace = true
+gravity-client.workspace = true
+axum = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+serde = { workspace = true }
+serde_json.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -1,0 +1,27 @@
+[package]
+name = "gravity-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The Gravity orchestrator: account selection, failover, AFC, and the sync facade."
+
+[lints.rust]
+missing_docs = "warn"
+
+[dependencies]
+gravity-core.workspace = true
+gravity-http.workspace = true
+gravity-accounts.workspace = true
+gravity-providers.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+async-trait.workspace = true

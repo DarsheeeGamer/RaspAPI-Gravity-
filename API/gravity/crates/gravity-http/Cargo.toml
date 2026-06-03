@@ -1,0 +1,27 @@
+[package]
+name = "gravity-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "HTTP transport with browser TLS/JA3 impersonation for Gravity, built on wreq (BoringSSL)."
+
+[lints.rust]
+missing_docs = "warn"
+
+[dependencies]
+gravity-core.workspace = true
+wreq = { version = "5", features = ["json", "stream", "cookies"] }
+wreq-util = "2"
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

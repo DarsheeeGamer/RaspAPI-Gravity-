@@ -1,0 +1,20 @@
+[package]
+name = "gravity-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Command-line interface for the Gravity AI gateway."
+
+[[bin]]
+name = "gravity"
+path = "src/main.rs"
+
+[dependencies]
+gravity-core.workspace = true
+gravity-providers.workspace = true
+gravity-client.workspace = true
+clap = { version = "4", features = ["derive"] }
+serde_json.workspace = true

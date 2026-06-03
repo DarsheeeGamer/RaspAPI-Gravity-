@@ -1,47 +1,82 @@
+"""API key management — generation and validation via LevelDB."""
+
 import secrets
-import plyvel
-import os
 import json
 import time
+import os
+from typing import Optional
 
 from account import get_db
 
-def generate_api_key() -> str:
-    """
-    Generates a secure, 32-character key with grav_ prefix and persists it in LevelDB.
-    """
-    key = secrets.token_urlsafe(24)
-    full_key = f"grav_{key}"
-    
-    db_conn = get_db()
-    key_data = {
-        "key": full_key,
-        "status": "active",
-        "pool": "default",
-        "created_at": time.time()
-    }
-    
-    db_key = f"apikey:{full_key}".encode("utf-8")
-    db_conn.put(db_key, json.dumps(key_data).encode("utf-8"))
-    
-    return key
+# Server-side admin key — set this env var to protect admin endpoints.
+ADMIN_KEY = os.environ.get("GRAVITY_ADMIN_KEY", "")
+
+
+def generate_api_key(label: Optional[str] = None, tier: str = "default") -> str:
+    """Generate and persist a new active API key. Returns the full key with grav_ prefix."""
+    raw = secrets.token_urlsafe(24)
+    full_key = f"grav_{raw}"
+    db = get_db()
+    db.put(
+        f"apikey:{full_key}".encode(),
+        json.dumps({
+            "key": full_key,
+            "status": "active",
+            "tier": tier,
+            "label": label or "",
+            "created_at": time.time(),
+        }).encode(),
+    )
+    return full_key
+
 
 def validate_api_key(key: str) -> bool:
-    """
-    Validates an API key against LevelDB, verifying it exists and is active.
-    """
+    """Return True if the key exists and is active."""
     if key == "grav_demoapikey":
         return True
-        
-    db_conn = get_db()
-    db_key = f"apikey:{key}".encode("utf-8")
-    val_bytes = db_conn.get(db_key)
-    
-    if val_bytes:
-        try:
-            data = json.loads(val_bytes.decode("utf-8"))
-            return data.get("status") == "active"
-        except Exception:
-            pass
-            
-    return False
+    db = get_db()
+    raw = db.get(f"apikey:{key}".encode())
+    if not raw:
+        return False
+    try:
+        return json.loads(raw.decode()).get("status") == "active"
+    except Exception:
+        return False
+
+
+def get_key_tier(key: str) -> str:
+    """Return the tier of an API key: 'default' or 'admin'."""
+    if key == "grav_demoapikey":
+        return "default"
+    db = get_db()
+    raw = db.get(f"apikey:{key}".encode())
+    if not raw:
+        return "default"
+    try:
+        return json.loads(raw.decode()).get("tier", "default")
+    except Exception:
+        return "default"
+
+
+def revoke_api_key(key: str) -> bool:
+    """Revoke an API key. Returns True if it existed."""
+    db = get_db()
+    db_key = f"apikey:{key}".encode()
+    raw = db.get(db_key)
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw.decode())
+        data["status"] = "revoked"
+        data["revoked_at"] = time.time()
+        db.put(db_key, json.dumps(data).encode())
+        return True
+    except Exception:
+        return False
+
+
+def is_admin(key: str) -> bool:
+    """True if key is the admin key or has admin tier."""
+    if ADMIN_KEY and key == ADMIN_KEY:
+        return True
+    return get_key_tier(key) == "admin"
