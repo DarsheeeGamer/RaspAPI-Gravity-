@@ -19,10 +19,11 @@ import time
 import secrets
 import hashlib
 import asyncio
+import contextlib
 from typing import Any, Dict, List, Optional
 
 import fastapi as meow
-from fastapi import HTTPException, Depends, Request, Query
+from fastapi import HTTPException, Depends, Request, Query, Header
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +31,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import abuse
 import cache
 import history
+import auth
+import quota
+import jobs
 from models import ChatRequest as ChatReq, AddAccountRequest
 from genapi import generate_api_key, validate_api_key, is_admin, revoke_api_key
 from llm import (
@@ -43,12 +47,23 @@ from account import (
 import balancer
 from providers import PROVIDERS, FREE_PROVIDERS
 
+@contextlib.asynccontextmanager
+async def _lifespan(app):
+    jobs.register_default_jobs()
+    jobs.scheduler.start()
+    try:
+        yield
+    finally:
+        await jobs.scheduler.stop()
+
+
 app = meow.FastAPI(
     title="GravityAPI Gateway",
     description="Unified multi-provider LLM gateway powered by GravityV2.",
-    version="3.0.0",
+    version="3.1.0",
     docs_url=None,
     redoc_url=None,
+    lifespan=_lifespan,
 )
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=False,
@@ -59,7 +74,30 @@ security = HTTPBearer(auto_error=False)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "0.0.0.0"
+
+
+async def get_principal(request: Request,
+                        authorization: Optional[str] = Header(None)) -> auth.Principal:
+    """Optional auth — resolves an API key / JWT, or an anonymous IP principal."""
+    return auth.resolve_principal(authorization, _client_ip(request))
+
+
+async def require_principal(request: Request,
+                            authorization: Optional[str] = Header(None)) -> auth.Principal:
+    """Authenticated-only — rejects anonymous callers."""
+    p = auth.resolve_principal(authorization, _client_ip(request))
+    if not p.is_authenticated:
+        raise HTTPException(401, "Authentication required. Provide Authorization: Bearer <key|jwt>.")
+    return p
+
+
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    """Legacy API-key dependency (account/conversation management)."""
     if not credentials:
         raise HTTPException(401, "Missing API key. Set Authorization: Bearer grav_...")
     token = credentials.credentials
@@ -77,20 +115,17 @@ async def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(secur
     return token
 
 
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "0.0.0.0"
+# ── Gatekeeping: dual (auth + anon) abuse + tiered quota ───────────────────────
 
-
-# ── Gatekeeping: abuse + rate limit ────────────────────────────────────────────
-
-def _gate(request: Request, api_key: str, provider: str, prompt_hash: str = "") -> str:
-    """Abuse-check + per-tier rate-limit. Returns the resolved pool, or raises."""
+def _gate(request: Request, principal: auth.Principal, provider: str,
+          prompt_hash: str = "") -> str:
+    """Abuse-check + tier-quota for a principal (authenticated or anonymous).
+    Returns the abuse action ("allow"/"throttle"), or raises 4xx."""
     ip = _client_ip(request)
+    # Abuse identity: the key for authed callers, the IP for anonymous.
+    ident = principal.api_key or principal.id
 
-    decision = abuse.check(api_key, ip, prompt_hash)
+    decision = abuse.check(ident, ip, prompt_hash)
     if not decision.allowed:
         raise HTTPException(
             429 if decision.action != "hard_ban" else 403,
@@ -98,27 +133,30 @@ def _gate(request: Request, api_key: str, provider: str, prompt_hash: str = "") 
             headers={"Retry-After": str(decision.retry_after_s)} if decision.retry_after_s else None,
         )
 
-    has_custom = provider in get_providers_for_key(api_key)
-    if not has_custom and provider not in FREE_PROVIDERS:
+    # Anonymous callers: free providers only, no custom accounts.
+    has_custom = bool(principal.api_key) and provider in get_providers_for_key(principal.api_key)
+    if not principal.is_authenticated and provider not in FREE_PROVIDERS:
+        raise HTTPException(
+            401,
+            f"Provider '{provider}' requires authentication. "
+            "Sign up (POST /auth/signup) or send Authorization: Bearer <key>.",
+        )
+    if principal.is_authenticated and not has_custom and provider not in FREE_PROVIDERS:
         raise HTTPException(
             400,
-            f"Provider '{provider}' requires a registered account. "
-            "Add one via POST /api/add . See GET /api/providers.",
+            f"Provider '{provider}' requires a registered account. Add one via POST /api/add.",
         )
 
-    # Hourly rate limit (sliding hour bucket) in RocksDB.
-    limit = 2000 if has_custom else (5 if api_key == "grav_demoapikey" else 20)
-    from account import get_db
-    db = get_db()
-    hour = int(time.time() / 3600)
-    rl_key = f"ratelimit:{api_key}:{ip}:{hour}".encode()
-    raw = db.get(rl_key)
-    count = int(raw.decode()) if raw else 0
-    if count >= limit:
-        raise HTTPException(429, f"Hourly rate limit of {limit} req/hr exceeded.")
-    db.put(rl_key, str(count + 1).encode())
-
-    return "custom" if has_custom else "default", decision.action  # type: ignore
+    # Tiered per-provider quota (hot RocksDB counter at the cell path).
+    tier = "custom" if has_custom else principal.tier
+    limit = auth.quota_limit_for(tier)
+    ok, qstat = quota.try_consume(ident, provider, default_limit=limit)
+    if not ok:
+        raise HTTPException(
+            429, detail={"error": "quota exceeded", "tier": tier, **qstat},
+            headers={"Retry-After": str(qstat.get("reset_in_s", 60))},
+        )
+    return decision.action
 
 
 # ── Message / tool conversion ──────────────────────────────────────────────────
@@ -190,51 +228,56 @@ def _prompt_fingerprint(messages: List[Dict[str, Any]]) -> str:
 # ── Chat completions ───────────────────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatReq, request: Request, token: str = Depends(verify_token)):
-    """OpenAI-compatible chat — load-balanced, abuse-gated, optional history.
+async def chat_completions(req: ChatReq, request: Request,
+                           principal: auth.Principal = Depends(get_principal)):
+    """OpenAI-compatible chat — works authenticated **or** anonymously (free
+    providers only, strict quota). Load-balanced, abuse-gated, optional history.
     Responses are never cached."""
     provider, model_name = resolve_model(req.model)
     full = full_model_name(provider, model_name)
     ip = _client_ip(request)
+    # Scope for accounts / quota / history: the key for authed, the IP id for anon.
+    scope = principal.api_key or principal.id
 
-    pool, action = _gate(request, token, provider, _prompt_fingerprint(req.messages))
+    action = _gate(request, principal, provider, _prompt_fingerprint(req.messages))
     if action == "throttle":
         await asyncio.sleep(2)  # soft back-pressure on elevated abuse score
 
-    # History: prepend stored transcript + system prompt when continuing a thread.
+    # History only for authenticated principals (anonymous = stateless).
     convo_msgs: List[Dict[str, Any]] = []
     stored_system = None
-    if req.conversation_id:
-        rec = history.get_or_create(token, req.conversation_id, system_prompt=req.system_prompt)
+    persist = bool(req.conversation_id and req.store and principal.is_authenticated)
+    if req.conversation_id and principal.is_authenticated:
+        rec = history.get_or_create(scope, req.conversation_id, system_prompt=req.system_prompt)
         stored_system = rec.get("system_prompt")
-        convo_msgs = history.history_messages(token, req.conversation_id)
+        convo_msgs = history.history_messages(scope, req.conversation_id)
 
     effective_raw = convo_msgs + req.messages
     messages, sys_in = _parse_messages(effective_raw)
     system_prompt = req.system_prompt or sys_in or stored_system
     tools = _parse_tools(req.tools)
 
-    ident = f"{token}@{ip}"
+    ident = f"{scope}@{ip}"
     started = time.time()
 
     # Streaming: the generator owns the concurrency lease (inc here, dec in its finally).
     if req.stream:
         abuse.conc_inc(ident)
         return await _stream_response(
-            token, ip, req, full, provider, messages, system_prompt, tools, ident)
+            scope, ip, req, full, provider, messages, system_prompt, tools, ident, persist)
 
     # Non-streaming: lease scoped to this call.
     abuse.conc_inc(ident)
     try:
         try:
             resp = await generate_response(
-                token, req.model, messages, system_prompt, tools=tools,
+                scope, req.model, messages, system_prompt, tools=tools,
                 temperature=req.temperature, max_tokens=req.max_tokens, seed=req.seed)
         except NoAccountError as e:
             raise HTTPException(400, str(e))
         except Exception as e:
-            abuse.record_error(token, ip)
-            record_request(full, token, ip, provider, "error",
+            abuse.record_error(scope, ip)
+            record_request(full, scope, ip, provider, "error",
                            latency_ms=(time.time() - started) * 1000)
             raise HTTPException(502, f"Generation failed: {e}")
 
@@ -242,13 +285,13 @@ async def chat_completions(req: ChatReq, request: Request, token: str = Depends(
         oai_tcs = _format_tool_calls(resp.message.tool_calls)
         finish = "tool_calls" if oai_tcs else (resp.finish_reason or "stop")
 
-        if req.conversation_id and req.store:
+        if persist:
             to_store = list(req.messages)
             to_store.append({"role": "assistant", "content": content_text,
                              "tool_calls": oai_tcs or None})
-            history.append_messages(token, req.conversation_id, to_store)
+            history.append_messages(scope, req.conversation_id, to_store)
 
-        record_request(full, token, ip, provider, "ok", cached=False,
+        record_request(full, scope, ip, provider, "ok", cached=False,
                        latency_ms=(time.time() - started) * 1000,
                        in_tokens=resp.usage.input_tokens or 0,
                        out_tokens=resp.usage.output_tokens or 0)
@@ -275,7 +318,8 @@ async def chat_completions(req: ChatReq, request: Request, token: str = Depends(
         abuse.conc_dec(ident)
 
 
-async def _stream_response(token, ip, req, full, provider, messages, system_prompt, tools, ident):
+async def _stream_response(scope, ip, req, full, provider, messages, system_prompt,
+                           tools, ident, persist):
     chat_id = f"chatcmpl-{secrets.token_hex(12)}"
     created = int(time.time())
     started = time.time()
@@ -288,7 +332,7 @@ async def _stream_response(token, ip, req, full, provider, messages, system_prom
         collected = []
         try:
             async for piece in generate_stream(
-                token, req.model, messages, system_prompt, tools=tools,
+                scope, req.model, messages, system_prompt, tools=tools,
                 temperature=req.temperature, max_tokens=req.max_tokens):
                 collected.append(piece)
                 yield _sse({"id": chat_id, "object": "chat.completion.chunk", "created": created,
@@ -298,15 +342,15 @@ async def _stream_response(token, ip, req, full, provider, messages, system_prom
                         "model": req.model, "choices": [{"index": 0, "delta": {},
                         "finish_reason": "stop"}]})
             yield "data: [DONE]\n\n"
-            if req.conversation_id and req.store:
+            if persist:
                 txt = "".join(collected)
-                history.append_messages(token, req.conversation_id,
+                history.append_messages(scope, req.conversation_id,
                                         list(req.messages) + [{"role": "assistant", "content": txt}])
-            record_request(full, token, ip, provider, "ok",
+            record_request(full, scope, ip, provider, "ok",
                            latency_ms=(time.time() - started) * 1000)
         except Exception as e:
-            abuse.record_error(token, ip)
-            record_request(full, token, ip, provider, "error",
+            abuse.record_error(scope, ip)
+            record_request(full, scope, ip, provider, "error",
                            latency_ms=(time.time() - started) * 1000)
             yield _sse({"id": chat_id, "object": "chat.completion.chunk", "created": created,
                         "model": req.model, "choices": [{"index": 0,
@@ -333,10 +377,62 @@ def _extract_text(resp) -> str:
     return str(c or "")
 
 
+# ── Authentication ─────────────────────────────────────────────────────────────
+
+@app.post("/auth/signup")
+def auth_signup(payload: Dict[str, Any]):
+    try:
+        return auth.signup(payload.get("email", ""), payload.get("password", ""))
+    except auth.AuthError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/auth/login")
+def auth_login(payload: Dict[str, Any]):
+    try:
+        return auth.login(payload.get("email", ""), payload.get("password", ""))
+    except auth.AuthError as e:
+        raise HTTPException(401, str(e))
+
+
+@app.post("/auth/refresh")
+def auth_refresh(payload: Dict[str, Any]):
+    try:
+        return auth.refresh(payload.get("refresh_token", ""))
+    except auth.AuthError as e:
+        raise HTTPException(401, str(e))
+
+
+@app.get("/auth/me")
+def auth_me(principal: auth.Principal = Depends(require_principal)):
+    return {"kind": principal.kind, "tier": principal.tier,
+            "user_id": principal.user_id, "api_key": principal.api_key,
+            "authenticated": principal.is_authenticated}
+
+
+@app.get("/auth/keys")
+def auth_keys(principal: auth.Principal = Depends(require_principal)):
+    if not principal.user_id:
+        return {"keys": [principal.api_key] if principal.api_key else []}
+    return {"keys": auth.user_keys(principal.user_id)}
+
+
+@app.post("/auth/keys")
+def auth_new_key(payload: Dict[str, Any] = None,
+                 principal: auth.Principal = Depends(require_principal)):
+    payload = payload or {}
+    key = generate_api_key(label=payload.get("label", ""))
+    if principal.user_id:
+        from account import get_db
+        get_db().put(f"apikey:{key}:user".encode(), principal.user_id.encode())
+        auth._link_key_to_user(principal.user_id, key)
+    return {"api_key": key}
+
+
 # ── Models ──────────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
-def list_models(token: str = Depends(verify_token)):
+def list_models(principal: auth.Principal = Depends(get_principal)):
     now = int(time.time())
     data = []
     for pname, meta in PROVIDERS.items():
@@ -350,13 +446,13 @@ def list_models(token: str = Depends(verify_token)):
 
 @app.get("/v1/models/{provider}")
 async def list_provider_models(provider: str, live: bool = Query(False),
-                               token: str = Depends(verify_token)):
+                               principal: auth.Principal = Depends(get_principal)):
     provider = provider.lower()
     if provider not in PROVIDERS:
         raise HTTPException(404, f"Unknown provider: {provider!r}")
     meta = PROVIDERS[provider]
     now = int(time.time())
-    models = await list_models_for_provider(token, provider, live=live)
+    models = await list_models_for_provider(principal.api_key or "", provider, live=live)
     return {
         "object": "list", "provider": provider, "display_name": meta["display_name"],
         "requires_account": meta["requires_custom_account"],
@@ -463,9 +559,41 @@ def abuse_status(request: Request, token: str = Depends(verify_token)):
     return abuse.status(token, _client_ip(request))
 
 
+@app.get("/api/quota")
+def quota_status(principal: auth.Principal = Depends(get_principal), request: Request = None):
+    scope = principal.api_key or principal.id
+    eff = auth.quota_limit_for(principal.tier)
+    snap = quota.snapshot(scope)
+    # Surface the effective per-tier limit where no explicit ceiling is set.
+    for p in snap:
+        if not p.get("limit"):
+            p["limit"] = eff
+            p["remaining"] = None if eff == 0 else max(0, eff - p["usage"])
+            p["unlimited"] = eff == 0
+    return {"tier": principal.tier, "scope": scope,
+            "default_limit_per_hr": eff, "providers": snap}
+
+
+@app.get("/api/jobs")
+def jobs_report(token: str = Depends(verify_admin)):
+    return {"running": jobs.scheduler._task is not None, "jobs": jobs.scheduler.report()}
+
+
+@app.post("/api/jobs/run")
+async def jobs_run(payload: Dict[str, Any], token: str = Depends(verify_admin)):
+    """Trigger a maintenance job by name immediately."""
+    name = payload.get("name", "")
+    job = next((j for j in jobs.scheduler.jobs if j.name == name), None)
+    if not job:
+        raise HTTPException(404, f"unknown job: {name}. have: {[j.name for j in jobs.scheduler.jobs]}")
+    await jobs.scheduler._run_job(job)
+    return {"name": name, "last_result": job.last_result}
+
+
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "version": "3.0.0", "providers": len(PROVIDERS)}
+    return {"status": "ok", "version": "3.1.0", "providers": len(PROVIDERS),
+            "jobs_running": jobs.scheduler._task is not None}
 
 
 # ── Admin ─────────────────────────────────────────────────────────────────────

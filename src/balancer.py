@@ -19,10 +19,17 @@ import threading
 from dataclasses import dataclass
 from typing import List, Optional
 
-from gravity.accounts import AccountsFile, EmailBundle, ProviderAccount
+from gravity.accounts import (
+    AccountsFile, EmailBundle, ProviderAccount,
+    AuthConfig, TransportConfig, ProviderDefaults,
+)
+from gravity.capabilities import (
+    HistoryMode, ToolSupportMode, StructuredOutputMode, RemoteSessionMode,
+)
 from gravity.io import load_accounts
 
 from account import load_accounts_for_key, get_providers_for_key
+from providers import FREE_PROVIDERS
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
@@ -108,7 +115,39 @@ def _accounts_for(api_key: str, provider: str) -> tuple[list[ProviderAccount], s
             return accts, "default"
     except Exception:
         pass
+
+    # Free providers with no configured account → synthesize an anonymous one
+    # so anonymous/keyless callers can still reach them.
+    if provider in FREE_PROVIDERS:
+        anon = _anon_account(provider)
+        if anon is not None:
+            return [anon], "anonymous"
     return [], "default"
+
+
+def _anon_account(provider: str) -> Optional[ProviderAccount]:
+    from gravity.capabilities import ProviderName
+    pe = next((p for p in ProviderName if p.value == provider), None)
+    if pe is None:
+        return None
+    try:
+        return ProviderAccount(
+            account_id=f"anon-{provider}", provider=pe, enabled=True,
+            pool="anonymous", priority=-1, weight=1,
+            auth=AuthConfig(kind="anonymous", secret_ref="", extra={}),
+            transport=TransportConfig(base_url="", timeout_ms=60000,
+                                      impersonate="chrome136", verify_ssl=True,
+                                      extra_headers={}),
+            defaults=ProviderDefaults(
+                tool_support=ToolSupportMode.JSON_EMULATED,
+                structured_output=StructuredOutputMode.JSON_INSTRUCTION,
+                remote_session_mode=RemoteSessionMode.NONE,
+                supports_system_prompt=True,
+                default_history_mode=HistoryMode.STATELESS),
+            metadata={"source": "anonymous"},
+        )
+    except Exception:
+        return None
 
 
 def select_candidates(db, api_key: str, provider: str) -> List[Candidate]:

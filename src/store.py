@@ -118,6 +118,21 @@ def _init_schema(c: duckdb.DuckDBPyConnection) -> None:
     c.execute("CREATE INDEX IF NOT EXISTS idx_acct_rid ON accounts(rid);")
     c.execute("CREATE INDEX IF NOT EXISTS idx_acct_key ON accounts(api_key);")
 
+    # Users (auth) — bulk in DuckDB, email→user_id + user_id→rid pointers in RocksDB.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            rid           BIGINT,
+            user_id       VARCHAR,
+            email         VARCHAR,
+            password_hash VARCHAR,
+            tier          VARCHAR,
+            status        VARCHAR,
+            created_at    DOUBLE
+        );
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_user_rid ON users(rid);")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_user_email ON users(email);")
+
 
 def _next_rid() -> int:
     with _lock:
@@ -251,23 +266,22 @@ def log_request(api_key: str, ip: str, provider: str, model: str, status: str,
         )
 
 
-# ── Accounts (bulk in DuckDB, api_key→rid pointers in RocksDB) ─────────────────
+# ── Accounts (bulk in DuckDB cells; RocksDB cell-path pointers → rid) ──────────
+#
+# Pointer scheme (keyspace.cell_account):
+#   <api_key>:cell:<provider>:account:<account_id>  ->  DuckDB rid
+# A key's accounts are enumerated by prefix-scanning <api_key>:cell:.
 
-def _acct_ptr_key(api_key: str, account_id: str) -> str:
-    return f"acct:{api_key}:{account_id}"
-
-
-def _acct_index_key(api_key: str) -> bytes:
-    return f"acctidx:{api_key}".encode()
-
-
-def _acct_index(api_key: str) -> list[str]:
-    raw = get_db().get(_acct_index_key(api_key))
-    return json.loads(raw.decode()) if raw else []
+import keyspace as _ks
 
 
-def _acct_index_set(api_key: str, ids: list[str]) -> None:
-    get_db().put(_acct_index_key(api_key), json.dumps(ids).encode())
+def _ptr_put(rocks_key: bytes, rid: int) -> None:
+    get_db().put(rocks_key, str(rid).encode())
+
+
+def _ptr_get(rocks_key: bytes) -> Optional[int]:
+    raw = get_db().get(rocks_key)
+    return int(raw.decode()) if raw else None
 
 
 def upsert_account(api_key: str, account_id: str, provider: str, enabled: bool,
@@ -275,21 +289,18 @@ def upsert_account(api_key: str, account_id: str, provider: str, enabled: bool,
     import time
     with _lock:
         c = duck()
-        c.execute("DELETE FROM accounts WHERE api_key = ? AND account_id = ?",
-                  [api_key, account_id])
+        c.execute("DELETE FROM accounts WHERE api_key = ? AND account_id = ? AND provider = ?",
+                  [api_key, account_id, provider])
         rid = _next_rid()
         c.execute("INSERT INTO accounts VALUES (?,?,?,?,?,?,?,?,?,?)",
                   [rid, api_key, account_id, provider, enabled, pool, priority, weight,
                    json.dumps(gravity_account), time.time()])
-    set_pointer(_acct_ptr_key(api_key, account_id), rid)
-    ids = _acct_index(api_key)
-    if account_id not in ids:
-        ids.append(account_id)
-        _acct_index_set(api_key, ids)
+    # Hashmap-style cell pointer in RocksDB.
+    _ptr_put(_ks.cell_account(api_key, provider, account_id), rid)
 
 
-def get_account(api_key: str, account_id: str) -> Optional[dict]:
-    rid = get_pointer(_acct_ptr_key(api_key, account_id))
+def get_account(api_key: str, provider: str, account_id: str) -> Optional[dict]:
+    rid = _ptr_get(_ks.cell_account(api_key, provider, account_id))
     if rid is None:
         return None
     with _lock:
@@ -343,17 +354,80 @@ def providers_for_key(api_key: str) -> set[str]:
 def delete_account(api_key: str, account_id: str, provider: Optional[str] = None) -> int:
     with _lock:
         if provider:
-            cur = duck().execute(
+            duck().execute(
                 "DELETE FROM accounts WHERE api_key = ? AND account_id = ? AND provider = ?",
                 [api_key, account_id, provider])
+            get_db().delete(_ks.cell_account(api_key, provider, account_id))
         else:
-            cur = duck().execute(
+            # Drop the account across any provider; clear all matching cell pointers.
+            rows = duck().execute(
+                "SELECT provider FROM accounts WHERE api_key = ? AND account_id = ?",
+                [api_key, account_id]).fetchall()
+            duck().execute(
                 "DELETE FROM accounts WHERE api_key = ? AND account_id = ?",
                 [api_key, account_id])
-    del_pointer(_acct_ptr_key(api_key, account_id))
-    ids = [i for i in _acct_index(api_key) if i != account_id]
-    _acct_index_set(api_key, ids)
+            for (prov,) in rows:
+                get_db().delete(_ks.cell_account(api_key, prov, account_id))
     return 1
+
+
+# ── Users (bulk in DuckDB, email→user_id + user_id→rid pointers in RocksDB) ────
+
+def _user_email_ptr(email: str) -> str:
+    return f"useremail:{email.lower()}"
+
+
+def _user_rid_ptr(user_id: str) -> str:
+    return f"userrid:{user_id}"
+
+
+def create_user(user_id: str, email: str, password_hash: str,
+                tier: str = "user", status: str = "active") -> None:
+    import time
+    with _lock:
+        rid = _next_rid()
+        duck().execute("INSERT INTO users VALUES (?,?,?,?,?,?,?)",
+                       [rid, user_id, email.lower(), password_hash, tier, status, time.time()])
+    set_pointer(_user_rid_ptr(user_id), rid)
+    # email→user_id is a plain RocksDB mapping (not an rid).
+    get_db().put(f"ptr:{_user_email_ptr(email)}".encode(), user_id.encode())
+
+
+def user_id_by_email(email: str) -> Optional[str]:
+    raw = get_db().get(f"ptr:{_user_email_ptr(email)}".encode())
+    return raw.decode() if raw else None
+
+
+def get_user(user_id: str) -> Optional[dict]:
+    rid = get_pointer(_user_rid_ptr(user_id))
+    if rid is None:
+        return None
+    with _lock:
+        row = duck().execute(
+            "SELECT user_id, email, password_hash, tier, status, created_at FROM users WHERE rid = ?",
+            [rid]).fetchone()
+    if not row:
+        return None
+    return {"user_id": row[0], "email": row[1], "password_hash": row[2],
+            "tier": row[3], "status": row[4], "created_at": row[5]}
+
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    uid = user_id_by_email(email)
+    return get_user(uid) if uid else None
+
+
+def update_user(user_id: str, **fields) -> None:
+    cols = [k for k in ("password_hash", "tier", "status") if k in fields]
+    if not cols:
+        return
+    rid = get_pointer(_user_rid_ptr(user_id))
+    if rid is None:
+        return
+    sets = ", ".join(f"{c} = ?" for c in cols)
+    with _lock:
+        duck().execute(f"UPDATE users SET {sets} WHERE rid = ?",
+                       [fields[c] for c in cols] + [rid])
 
 
 def metrics_summary() -> dict:
