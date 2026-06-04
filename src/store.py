@@ -54,23 +54,6 @@ def _init_schema(c: duckdb.DuckDBPyConnection) -> None:
     c.execute("CREATE SEQUENCE IF NOT EXISTS rid_seq START 1;")
 
     c.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            rid        BIGINT,
-            conv_id    VARCHAR,
-            api_key    VARCHAR,
-            seq        INTEGER,
-            role       VARCHAR,
-            content    VARCHAR,
-            name       VARCHAR,
-            tool_calls VARCHAR,
-            tool_call_id VARCHAR,
-            ts         DOUBLE
-        );
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_rid ON messages(rid);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conv_id, seq);")
-
-    c.execute("""
         CREATE TABLE IF NOT EXISTS request_log (
             rid        BIGINT,
             ts         DOUBLE,
@@ -155,65 +138,6 @@ def del_pointer(logical_key: str) -> None:
         get_db().delete(f"ptr:{logical_key}".encode())
     except Exception:
         pass
-
-
-# ── Conversation messages (bulk in DuckDB, pointer = latest seq in LevelDB) ────
-
-def append_messages(api_key: str, conv_id: str, messages: list[dict]) -> int:
-    """Append messages to a conversation in DuckDB. Returns new message count."""
-    import time
-    with _lock:
-        c = duck()
-        # Current max seq for this conversation.
-        row = c.execute("SELECT COALESCE(MAX(seq), -1) FROM messages WHERE conv_id = ?",
-                        [conv_id]).fetchone()
-        seq = (row[0] if row else -1) + 1
-        for m in messages:
-            rid = _next_rid()
-            c.execute(
-                "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?)",
-                [rid, conv_id, api_key, seq,
-                 m.get("role", "user"),
-                 m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content")),
-                 m.get("name"),
-                 json.dumps(m.get("tool_calls")) if m.get("tool_calls") else None,
-                 m.get("tool_call_id"),
-                 time.time()],
-            )
-            # LevelDB pointer: last rid for (conv_id, seq) → instant tail lookups.
-            set_pointer(f"msg:{conv_id}:{seq}", rid)
-            seq += 1
-        return seq
-
-
-def get_messages(conv_id: str, limit: Optional[int] = None) -> list[dict]:
-    """Fetch a conversation's messages in order (point-indexed by conv_id)."""
-    with _lock:
-        q = "SELECT role, content, name, tool_calls, tool_call_id FROM messages WHERE conv_id = ? ORDER BY seq"
-        if limit:
-            q += f" DESC LIMIT {int(limit)}"
-        rows = duck().execute(q, [conv_id]).fetchall()
-    if limit:
-        rows = list(reversed(rows))
-    out = []
-    for role, content, name, tool_calls, tool_call_id in rows:
-        msg: dict[str, Any] = {"role": role, "content": content}
-        if name:
-            msg["name"] = name
-        if tool_calls:
-            try:
-                msg["tool_calls"] = json.loads(tool_calls)
-            except Exception:
-                pass
-        if tool_call_id:
-            msg["tool_call_id"] = tool_call_id
-        out.append(msg)
-    return out
-
-
-def delete_conversation_messages(conv_id: str) -> None:
-    with _lock:
-        duck().execute("DELETE FROM messages WHERE conv_id = ?", [conv_id])
 
 
 # ── Response cache bodies (bulk in DuckDB, TTL pointer in LevelDB) ─────────────

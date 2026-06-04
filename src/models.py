@@ -45,25 +45,6 @@ class AccountRecord(BaseModel):
     created_at: float = Field(default_factory=_now)
 
 
-# ── Conversations ──────────────────────────────────────────────────────────────
-
-class ConversationMeta(BaseModel):
-    id: str
-    title: str = ""
-    system_prompt: Optional[str] = None
-    created_at: float = Field(default_factory=_now)
-    updated_at: float = Field(default_factory=_now)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class StoredMessage(BaseModel):
-    role: str
-    content: Optional[Any] = None
-    name: Optional[str] = None
-    tool_calls: Optional[list[dict[str, Any]]] = None
-    tool_call_id: Optional[str] = None
-
-
 # ── Balancer health ─────────────────────────────────────────────────────────
 
 class HealthState(BaseModel):
@@ -103,6 +84,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    """Stateless chat request — the client owns history (full `messages` each call)."""
     model: str
     messages: list[dict[str, Any]] = Field(default_factory=list)
     stream: bool = False
@@ -114,11 +96,6 @@ class ChatRequest(BaseModel):
     tool_choice: Optional[Any] = None
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
-    # History management.
-    conversation_id: Optional[str] = None
-    store: bool = False               # persist this turn into the conversation
-    # Caching.
-    cache: bool = True                # allow cache hit/store when eligible
 
 
 class AddAccountRequest(BaseModel):

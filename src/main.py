@@ -1,17 +1,19 @@
 """GravityAPI Gateway — OpenAI-compatible multi-provider LLM gateway.
 
 Stack:
-  - RocksDB  — hot key-value index: API keys, pointers, balancer health, abuse,
-               discovery-list cache TTLs.
-  - DuckDB   — bulk + analytical store: accounts, conversation transcripts,
-               request log (metrics), discovery-list bodies.
+  - RocksDB  — hot key-value index: API keys, quota counters, pointers,
+               balancer health, abuse, discovery-list cache TTLs.
+  - DuckDB   — bulk + analytical store: accounts, request log (metrics),
+               discovery-list bodies.
   - Pydantic — validated models for all stored + wire data.
   - Load balancer with health + failover across accounts.
   - Abuse detection (burst / duplicate / error-storm / concurrency).
-  - Server-side conversation history (opt-in via conversation_id).
+  - Auth (API key / JWT / anonymous) with tiered per-provider quota.
   - HTTP/3 (QUIC) via Hypercorn — see run_http3.py.
 
-Responses are NOT cached (only model-discovery lists are).
+**Stateless**: the client owns conversation history (full `messages` array each
+call, OpenAI-style). The server never persists transcripts. Responses are NOT
+cached either (only model-discovery lists are).
 """
 
 import json
@@ -30,7 +32,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import abuse
 import cache
-import history
 import auth
 import quota
 import jobs
@@ -230,31 +231,22 @@ def _prompt_fingerprint(messages: List[Dict[str, Any]]) -> str:
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatReq, request: Request,
                            principal: auth.Principal = Depends(get_principal)):
-    """OpenAI-compatible chat — works authenticated **or** anonymously (free
-    providers only, strict quota). Load-balanced, abuse-gated, optional history.
-    Responses are never cached."""
+    """OpenAI-compatible **stateless** chat — works authenticated **or**
+    anonymously (free providers only, strict quota). Load-balanced, abuse-gated.
+    The client sends the full message history each call; nothing is persisted."""
     provider, model_name = resolve_model(req.model)
     full = full_model_name(provider, model_name)
     ip = _client_ip(request)
-    # Scope for accounts / quota / history: the key for authed, the IP id for anon.
+    # Scope for accounts / quota: the key for authed, the IP id for anon.
     scope = principal.api_key or principal.id
 
     action = _gate(request, principal, provider, _prompt_fingerprint(req.messages))
     if action == "throttle":
         await asyncio.sleep(2)  # soft back-pressure on elevated abuse score
 
-    # History only for authenticated principals (anonymous = stateless).
-    convo_msgs: List[Dict[str, Any]] = []
-    stored_system = None
-    persist = bool(req.conversation_id and req.store and principal.is_authenticated)
-    if req.conversation_id and principal.is_authenticated:
-        rec = history.get_or_create(scope, req.conversation_id, system_prompt=req.system_prompt)
-        stored_system = rec.get("system_prompt")
-        convo_msgs = history.history_messages(scope, req.conversation_id)
-
-    effective_raw = convo_msgs + req.messages
-    messages, sys_in = _parse_messages(effective_raw)
-    system_prompt = req.system_prompt or sys_in or stored_system
+    # Stateless: the client owns history — we only ever use the request's messages.
+    messages, sys_in = _parse_messages(req.messages)
+    system_prompt = req.system_prompt or sys_in
     tools = _parse_tools(req.tools)
 
     ident = f"{scope}@{ip}"
@@ -264,7 +256,7 @@ async def chat_completions(req: ChatReq, request: Request,
     if req.stream:
         abuse.conc_inc(ident)
         return await _stream_response(
-            scope, ip, req, full, provider, messages, system_prompt, tools, ident, persist)
+            scope, ip, req, full, provider, messages, system_prompt, tools, ident)
 
     # Non-streaming: lease scoped to this call.
     abuse.conc_inc(ident)
@@ -285,12 +277,6 @@ async def chat_completions(req: ChatReq, request: Request,
         oai_tcs = _format_tool_calls(resp.message.tool_calls)
         finish = "tool_calls" if oai_tcs else (resp.finish_reason or "stop")
 
-        if persist:
-            to_store = list(req.messages)
-            to_store.append({"role": "assistant", "content": content_text,
-                             "tool_calls": oai_tcs or None})
-            history.append_messages(scope, req.conversation_id, to_store)
-
         record_request(full, scope, ip, provider, "ok", cached=False,
                        latency_ms=(time.time() - started) * 1000,
                        in_tokens=resp.usage.input_tokens or 0,
@@ -301,7 +287,6 @@ async def chat_completions(req: ChatReq, request: Request,
             "object": "chat.completion",
             "created": int(time.time()),
             "model": req.model,
-            "conversation_id": req.conversation_id,
             "choices": [{"index": 0, "message": {
                 "role": "assistant",
                 "content": content_text or None,
@@ -319,7 +304,7 @@ async def chat_completions(req: ChatReq, request: Request,
 
 
 async def _stream_response(scope, ip, req, full, provider, messages, system_prompt,
-                           tools, ident, persist):
+                           tools, ident):
     chat_id = f"chatcmpl-{secrets.token_hex(12)}"
     created = int(time.time())
     started = time.time()
@@ -329,12 +314,10 @@ async def _stream_response(scope, ip, req, full, provider, messages, system_prom
         yield _sse({"id": chat_id, "object": "chat.completion.chunk", "created": created,
                     "model": req.model, "choices": [{"index": 0,
                     "delta": {"role": "assistant"}, "finish_reason": None}]})
-        collected = []
         try:
             async for piece in generate_stream(
                 scope, req.model, messages, system_prompt, tools=tools,
                 temperature=req.temperature, max_tokens=req.max_tokens):
-                collected.append(piece)
                 yield _sse({"id": chat_id, "object": "chat.completion.chunk", "created": created,
                             "model": req.model, "choices": [{"index": 0,
                             "delta": {"content": piece}, "finish_reason": None}]})
@@ -342,10 +325,6 @@ async def _stream_response(scope, ip, req, full, provider, messages, system_prom
                         "model": req.model, "choices": [{"index": 0, "delta": {},
                         "finish_reason": "stop"}]})
             yield "data: [DONE]\n\n"
-            if persist:
-                txt = "".join(collected)
-                history.append_messages(scope, req.conversation_id,
-                                        list(req.messages) + [{"role": "assistant", "content": txt}])
             record_request(full, scope, ip, provider, "ok",
                            latency_ms=(time.time() - started) * 1000)
         except Exception as e:
@@ -461,36 +440,6 @@ async def list_provider_models(provider: str, live: bool = Query(False),
                   "display_name": m.get("display_name"), "description": m.get("description"),
                   "tags": m.get("tags", [])} for m in models],
     }
-
-
-# ── Conversations (history management) ─────────────────────────────────────────
-
-@app.post("/v1/conversations")
-def create_conversation(payload: Dict[str, Any] = None, token: str = Depends(verify_token)):
-    payload = payload or {}
-    rec = history.create_conversation(
-        token, system_prompt=payload.get("system_prompt"), title=payload.get("title"))
-    return rec
-
-
-@app.get("/v1/conversations")
-def list_conversations(token: str = Depends(verify_token)):
-    return {"conversations": history.list_conversations(token)}
-
-
-@app.get("/v1/conversations/{conv_id}")
-def get_conversation(conv_id: str, token: str = Depends(verify_token)):
-    rec = history.get_conversation(token, conv_id)
-    if rec is None:
-        raise HTTPException(404, "Conversation not found.")
-    return rec
-
-
-@app.delete("/v1/conversations/{conv_id}")
-def delete_conversation(conv_id: str, token: str = Depends(verify_token)):
-    if not history.delete_conversation(token, conv_id):
-        raise HTTPException(404, "Conversation not found.")
-    return {"status": "deleted", "id": conv_id}
 
 
 # ── Account management ─────────────────────────────────────────────────────────
@@ -629,19 +578,20 @@ def admin_ban(payload: Dict[str, Any], token: str = Depends(verify_admin)):
 @app.get("/")
 def index():
     return {
-        "service": "GravityAPI Gateway", "version": "3.0.0",
+        "service": "GravityAPI Gateway", "version": "3.1.0",
+        "stateless": True,
         "providers": len(PROVIDERS), "free_providers": sorted(FREE_PROVIDERS),
         "storage": {"index": "RocksDB", "bulk": "DuckDB"},
         "features": ["load-balancer", "failover", "abuse-detection",
-                     "conversation-history", "http3", "streaming"],
+                     "tiered-quota", "auth", "http3", "streaming"],
         "endpoints": {
-            "POST /v1/chat/completions": "chat (stream + non-stream, history, balanced)",
+            "POST /v1/chat/completions": "stateless chat (stream + non-stream, balanced)",
             "GET  /v1/models[/{provider}?live=]": "model catalog / live discovery",
-            "POST /v1/conversations": "create conversation",
-            "GET/DELETE /v1/conversations/{id}": "fetch / delete conversation",
+            "POST /auth/signup|login|refresh": "authentication",
             "POST /api/add": "register a provider account",
             "GET  /api/accounts": "your accounts",
             "GET  /api/providers": "provider catalog",
+            "GET  /api/quota": "your quota usage",
             "GET  /api/metrics": "analytics (DuckDB)",
             "GET  /api/balancer": "account health",
             "GET  /api/abuse": "your abuse score",
